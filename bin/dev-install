@@ -1,0 +1,41 @@
+#!/usr/bin/env bash
+#
+# Copy the working tree into Omarchy's plugin directory and reload the shell.
+#
+# A symlink would be less to type, but `omarchy plugin validate` refuses
+# symlinks anywhere in a plugin folder, so a copy is what actually matches how
+# the plugin ships. Saving files under ~/.config/omarchy/plugins/ makes the
+# shell hot-reload plugin code on its own; the explicit rescan below covers the
+# first install, when the directory did not exist yet.
+
+set -euo pipefail
+
+PLUGIN_ID="com.anilcelik.temporal"
+SOURCE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+TARGET_DIR="$HOME/.config/omarchy/plugins/$PLUGIN_ID"
+
+if ! command -v omarchy-plugin-validate >/dev/null 2>&1; then
+  echo "dev-install: omarchy is not installed on this machine" >&2
+  exit 1
+fi
+
+# Validate the source, not the copy: a failure here should leave whatever is
+# already installed untouched and running.
+omarchy-plugin-validate "$SOURCE_DIR"
+
+mkdir -p "$TARGET_DIR"
+rsync -a --delete \
+  --exclude '.git/' \
+  --exclude 'testbed/' \
+  "$SOURCE_DIR"/ "$TARGET_DIR"/
+
+echo "installed $PLUGIN_ID -> $TARGET_DIR"
+
+omarchy-shell shell rescanPlugins >/dev/null 2>&1 || true
+
+if omarchy-shell shell listPlugins 2>/dev/null | jq -e --arg id "$PLUGIN_ID" \
+  'map(select(.id == $id and .enabled)) | length > 0' >/dev/null; then
+  echo "enabled — the widget is live in the bar"
+else
+  echo "not enabled yet. Run: omarchy plugin enable $PLUGIN_ID"
+fi

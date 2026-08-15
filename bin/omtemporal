@@ -1,0 +1,240 @@
+#!/usr/bin/env bash
+#
+# Manage the Temporal Omarchy widget from a terminal.
+#
+# Everything here talks to the running widget over the shell's IPC, so the
+# command line and the panel share one implementation of what an address means
+# and how it gets persisted. Nothing in this script edits shell.json.
+
+set -euo pipefail
+
+PLUGIN_ID="com.anilcelik.temporal"
+PLUGIN_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+usage() {
+  cat <<'USAGE'
+Usage: omtemporal <command> [args]
+
+  setup                  Interactive: pick from what is on this machine
+  list                   Show configured servers
+  add <target> [label]   Add a server
+  remove <label>         Remove a server
+  status                 One-line summary of the whole fleet
+  doctor                 Check every server, and why one might be empty
+  open [level ...]       Open the panel, optionally at a level
+
+Targets:
+  http://host:7243       HTTP API   (faster; needs httpPort enabled)
+  host:7233              gRPC       (via the temporal CLI)
+  profile:NAME           a profile from your temporal.toml
+
+Examples:
+  omtemporal add http://localhost:7243 local
+  omtemporal add profile:prod
+  omtemporal open namespace 0 orders
+USAGE
+}
+
+fail() {
+  echo "omtemporal: $*" >&2
+  exit 1
+}
+
+# Every subcommand needs the widget loaded; say so once, clearly, instead of
+# letting each call fail with "Target not found".
+require_widget() {
+  command -v omarchy-shell >/dev/null 2>&1 || fail "omarchy is not installed"
+  if ! omarchy-shell shell ping >/dev/null 2>&1; then
+    fail "omarchy-shell is not running"
+  fi
+  if ! omarchy-shell temporal status >/dev/null 2>&1; then
+    fail "the Temporal widget is not enabled. Run: omarchy plugin enable $PLUGIN_ID"
+  fi
+}
+
+ipc() {
+  omarchy-shell temporal "$@"
+}
+
+cmd_list() {
+  require_widget
+  local out
+  out=$(ipc listServers)
+  if [[ $out == "no servers configured" ]]; then
+    echo "$out"
+    return
+  fi
+  printf '%-20s %-6s %s\n' "LABEL" "VIA" "ADDRESS"
+  printf '%s\n' "$out" | awk -F '\t' '{ printf "%-20s %-6s %s\n", $1, $2, $3 }'
+}
+
+cmd_add() {
+  require_widget
+  [[ $# -ge 1 ]] || fail "add needs a target. See: omtemporal --help"
+  ipc add "$*"
+}
+
+cmd_remove() {
+  require_widget
+  [[ $# -ge 1 ]] || fail "remove needs a label"
+  ipc remove "$*"
+}
+
+cmd_status() {
+  require_widget
+  ipc status
+}
+
+cmd_open() {
+  require_widget
+  if (( $# == 0 )); then
+    ipc open >/dev/null
+    return
+  fi
+  local level="$1"
+  shift
+  local route
+  case "$level" in
+  setup) ipc setup >/dev/null; return ;;
+  server) route=$(jq -cn --argjson i "${1:-0}" '{level:"server", serverIndex:$i}') ;;
+  namespace) route=$(jq -cn --argjson i "${1:-0}" --arg n "${2:-default}" '{level:"namespace", serverIndex:$i, namespace:$n}') ;;
+  workflow) route=$(jq -cn --argjson i "${1:-0}" --arg n "${2:-default}" --arg w "${3:-}" '{level:"workflow", serverIndex:$i, namespace:$n, workflowId:$w}') ;;
+  taskqueue) route=$(jq -cn --argjson i "${1:-0}" --arg n "${2:-default}" --arg q "${3:-}" '{level:"taskQueue", serverIndex:$i, namespace:$n, taskQueue:$q}') ;;
+  *) fail "unknown level: $level (server, namespace, workflow, taskqueue, setup)" ;;
+  esac
+  ipc openAt "$route" >/dev/null
+}
+
+# The interactive picker. gum is what omarchy's own commands use; without it
+# this degrades to a numbered prompt rather than refusing to run.
+cmd_setup() {
+  require_widget
+
+  echo "Looking for Temporal servers…"
+  local found
+  found=$(python3 "$PLUGIN_DIR/collect.py" \
+    '{"mode":"discover","addresses":["localhost:7233","localhost:7234","localhost:7235"],"timeoutSec":6}')
+
+  local -a targets=() labels=()
+  while IFS=$'\t' read -r target label; do
+    [[ -n $target ]] || continue
+    targets+=("$target")
+    labels+=("$label")
+  done < <(
+    # HTTP first: it is the transport people should prefer when it is available.
+    for port in 7243 7244 7245; do
+      if curl -sf -m 2 "http://localhost:$port/api/v1/cluster-info" >/dev/null 2>&1; then
+        printf 'http://localhost:%s\tlocalhost:%s (HTTP API)\n' "$port" "$port"
+      fi
+    done
+    jq -r '.grpc[]? | select(.ok) | "\(.address)\t\(.address) (gRPC, via CLI)"' <<<"$found"
+    jq -r '.profiles[]? | "profile:\(.name)\tprofile \(.name) — \(.address // "from temporal.toml")"' <<<"$found"
+  )
+
+  if (( ${#targets[@]} == 0 )); then
+    echo "Nothing found on the usual local ports, and no CLI profiles."
+    echo "Add one by hand:  omtemporal add http://host:7243"
+    return
+  fi
+
+  local choice=""
+  if command -v gum >/dev/null 2>&1; then
+    choice=$(printf '%s\n' "${labels[@]}" | gum choose --header "Add which server?") || return
+  else
+    echo
+    local i
+    for i in "${!labels[@]}"; do printf '  %d) %s\n' "$((i + 1))" "${labels[$i]}"; done
+    echo
+    read -r -p "Add which? [1-${#labels[@]}, blank to cancel] " reply
+    [[ -n $reply ]] || return
+    [[ $reply =~ ^[0-9]+$ ]] || fail "not a number: $reply"
+    (( reply >= 1 && reply <= ${#labels[@]} )) || fail "out of range: $reply"
+    choice="${labels[$((reply - 1))]}"
+  fi
+
+  local i
+  for i in "${!labels[@]}"; do
+    if [[ ${labels[$i]} == "$choice" ]]; then
+      ipc add "${targets[$i]}"
+      return
+    fi
+  done
+}
+
+# The answer to "why is my widget empty".
+cmd_doctor() {
+  command -v omarchy-shell >/dev/null 2>&1 || fail "omarchy is not installed"
+
+  echo "omarchy-shell"
+  if omarchy-shell shell ping >/dev/null 2>&1; then
+    echo "  ok        running"
+  else
+    echo "  FAIL      not running — start your session's shell"
+    return 1
+  fi
+
+  echo "widget"
+  if omarchy-shell temporal status >/dev/null 2>&1; then
+    echo "  ok        enabled ($(omarchy-shell temporal status))"
+  else
+    echo "  FAIL      not enabled — omarchy plugin enable $PLUGIN_ID"
+    return 1
+  fi
+
+  echo "temporal CLI"
+  if command -v temporal >/dev/null 2>&1; then
+    echo "  ok        $(temporal --version 2>/dev/null | head -1)"
+  else
+    echo "  warn      not installed — servers using transport \"cli\" cannot be read"
+    echo "            https://docs.temporal.io/cli#install"
+  fi
+
+  echo "servers"
+  local report
+  report=$(omarchy-shell temporal servers)
+  if [[ $report == "no servers configured" ]]; then
+    echo "  warn      none configured — run: omtemporal setup"
+    return 0
+  fi
+  printf '%s\n' "$report" | while IFS= read -r line; do
+    if [[ $line == *"down:"* ]]; then
+      echo "  FAIL      $line"
+    elif [[ $line == *"pending"* ]]; then
+      # A CLI-transport server spends a moment per poll shelling out; that is
+      # not a fault, and reporting it as one would send people hunting.
+      echo "  ...       $line (mid-poll)"
+    else
+      echo "  ok        $line"
+    fi
+  done
+
+  # The single most common cause of an empty panel: the HTTP API is off, so
+  # check it separately from whether the plugin happens to be using it.
+  echo "http api"
+  local any=0
+  while IFS= read -r url; do
+    [[ -n $url ]] || continue
+    any=1
+    if curl -sf -m 3 "$url/api/v1/cluster-info" >/dev/null 2>&1; then
+      echo "  ok        $url"
+    else
+      echo "  FAIL      $url did not answer — is the server started with --http-port?"
+    fi
+  done < <(printf '%s\n' "$report" | awk -F '·' '/http/ { gsub(/ /, "", $3); if ($3 != "") print "http://" $3 }')
+  (( any == 1 )) || echo "  --        no servers using the http transport"
+}
+
+command="${1:-}"
+(( $# > 0 )) && shift || true
+
+case "$command" in
+setup) cmd_setup "$@" ;;
+list) cmd_list "$@" ;;
+add) cmd_add "$@" ;;
+remove) cmd_remove "$@" ;;
+status) cmd_status "$@" ;;
+doctor) cmd_doctor "$@" ;;
+open) cmd_open "$@" ;;
+-h | --help | help | "") usage ;;
+*) fail "unknown command: $command" ;;
+esac

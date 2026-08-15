@@ -1,0 +1,118 @@
+# Two independent Temporal dev servers, so the plugin's multi-server
+# aggregation and per-server failure handling are exercised for real rather
+# than assumed. Each container keeps its own default ports internally
+# (7233 gRPC / 7243 HTTP / 8233 UI) and is published on a distinct host port.
+#
+# --http-port is the whole reason this test bed exists: the plugin reads the
+# Temporal HTTP API, which the server leaves off unless asked.
+
+name: omtemporal
+
+x-server: &server
+  image: temporalio/temporal:1.8.2
+  restart: unless-stopped
+  healthcheck:
+    # The HTTP API is what the plugin talks to, so that is what "healthy" means
+    # here. A gRPC-only check would let workers start against a server whose
+    # HTTP listener had not come up.
+    test: ["CMD", "temporal", "operator", "cluster", "health", "--address", "127.0.0.1:7233"]
+    interval: 3s
+    timeout: 5s
+    retries: 20
+    start_period: 10s
+
+x-python: &python
+  build: ./worker
+  restart: unless-stopped
+  environment:
+    PYTHONUNBUFFERED: "1"
+
+services:
+  temporal-a:
+    <<: *server
+    container_name: omtemporal-a
+    command:
+      - server
+      - start-dev
+      - --ip=0.0.0.0
+      - --port=7233
+      - --http-port=7243
+      - --ui-port=8233
+      - --db-filename=/data/temporal.db
+      - --namespace=payments
+      - --namespace=orders
+    ports:
+      - "7233:7233"
+      - "7243:7243"
+      - "8233:8233"
+    volumes:
+      # Bind mount, not a named volume: the image runs as uid 1000 and a fresh
+      # named volume lands root-owned, which SQLite reports as a baffling
+      # "out of memory (14)". The host user is also uid 1000, so a bind mount
+      # is writable without any chown dance.
+      - ./data/a:/data
+
+  temporal-b:
+    <<: *server
+    container_name: omtemporal-b
+    command:
+      - server
+      - start-dev
+      - --ip=0.0.0.0
+      - --port=7233
+      - --http-port=7243
+      - --ui-port=8233
+      - --db-filename=/data/temporal.db
+      - --namespace=staging
+      - --namespace=analytics
+    ports:
+      - "7234:7233"
+      - "7244:7243"
+      - "8234:8233"
+    volumes:
+      - ./data/b:/data
+
+  # One worker process per server, hosting a Worker per namespace on a single
+  # asyncio loop. A Temporal Worker is bound to one namespace, so the fan-out
+  # has to happen somewhere; doing it in-process keeps the compose file honest
+  # about what is actually a separate machine and what is not.
+  worker-a:
+    <<: *python
+    container_name: omtemporal-worker-a
+    command: ["python", "worker.py"]
+    environment:
+      PYTHONUNBUFFERED: "1"
+      TEMPORAL_ADDRESS: temporal-a:7233
+      TEMPORAL_NAMESPACES: default,payments,orders
+    depends_on:
+      temporal-a:
+        condition: service_healthy
+
+  worker-b:
+    <<: *python
+    container_name: omtemporal-worker-b
+    command: ["python", "worker.py"]
+    environment:
+      PYTHONUNBUFFERED: "1"
+      TEMPORAL_ADDRESS: temporal-b:7233
+      TEMPORAL_NAMESPACES: default,staging,analytics
+    depends_on:
+      temporal-b:
+        condition: service_healthy
+
+  # Keeps the boards alive: seeds a full spread of statuses on boot, then tops
+  # up every SEED_INTERVAL so "recent workflows" never goes stale and the
+  # running count moves while you watch it.
+  seeder:
+    <<: *python
+    container_name: omtemporal-seeder
+    command: ["python", "seed.py"]
+    environment:
+      PYTHONUNBUFFERED: "1"
+      SEED_TARGETS: temporal-a:7233=default,payments,orders;temporal-b:7233=default,staging,analytics
+      SEED_INTERVAL: "60"
+    depends_on:
+      worker-a:
+        condition: service_started
+      worker-b:
+        condition: service_started

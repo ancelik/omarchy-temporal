@@ -1,0 +1,73 @@
+{
+  "schemaVersion": 1,
+  "id": "com.anilcelik.temporal",
+  "name": "Temporal",
+  "version": "1.0.0",
+  "author": "Anil Celik",
+  "license": "MIT",
+  "description": "Workflow execution status across every Temporal server and namespace you can reach, in the Omarchy bar.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Temporal",
+    "description": "Running and failed Workflow Execution counts per namespace, with a recent-executions list that opens in the Temporal Web UI.",
+    "category": "Development",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "refreshIntervalSec": 30,
+      "openRefreshIntervalSec": 5,
+      "recentLimit": 25,
+      "requestTimeoutSec": 8,
+      "hideWhenIdle": false
+    },
+    "schema": [
+      {
+        "key": "refreshIntervalSec",
+        "type": "integer",
+        "label": "Refresh interval (seconds)",
+        "min": 5,
+        "max": 3600,
+        "step": 5,
+        "defaultValue": 30
+      },
+      {
+        "key": "openRefreshIntervalSec",
+        "type": "integer",
+        "label": "Refresh interval while open (seconds)",
+        "min": 2,
+        "max": 600,
+        "step": 1,
+        "defaultValue": 5
+      },
+      {
+        "key": "recentLimit",
+        "type": "integer",
+        "label": "Recent executions per namespace",
+        "min": 5,
+        "max": 100,
+        "step": 5,
+        "defaultValue": 25
+      },
+      {
+        "key": "requestTimeoutSec",
+        "type": "integer",
+        "label": "Request timeout (seconds)",
+        "min": 2,
+        "max": 60,
+        "step": 1,
+        "defaultValue": 8
+      },
+      {
+        "key": "hideWhenIdle",
+        "type": "boolean",
+        "label": "Hide from the bar when nothing is running",
+        "defaultValue": false
+      }
+    ]
+  }
+}
