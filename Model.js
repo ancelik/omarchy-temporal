@@ -551,8 +551,13 @@ function authConfigIssues(server) {
   }
 
   if (String(server.apiKey || "") !== "") {
+    // Both halves of this matter. shell.json is not a secret store, and saving
+    // it goes through `omarchy-shell shell setBarWidget <id> servers <json>`,
+    // which puts the value on that process's command line where anyone can read
+    // it. Neither is fixable from here; not needing an inline key is.
     issues.push(issue("warn",
-      "apiKey is stored in plain text in shell.json; apiKeyCommand keeps it in your password manager"))
+      "apiKey is stored in plain text in shell.json and passed on a command line when it is saved; "
+        + "apiKeyCommand avoids both"))
   }
 
   // A bearer token over cleartext http is handed to anything on the path. Local

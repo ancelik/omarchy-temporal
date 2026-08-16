@@ -370,9 +370,17 @@ collector spec as an argument to `collect.py`, and again passing `--api-key` to
 TLS *paths* are still flags. A path is not a secret; the key it points at never
 leaves the file.
 
-The one remaining hole is a custom header whose name cannot be spelled as an
-environment variable, which falls back to `--grpc-meta NAME=VALUE`. No header
-name in normal use hits this.
+Two holes remain, both outside this plugin's reach:
+
+- **A custom header whose name cannot be spelled as an environment variable**
+  falls back to `--grpc-meta NAME=VALUE`. No header name in normal use hits
+  this.
+- **Saving an inline `apiKey`** goes through
+  `omarchy-shell shell setBarWidget <id> servers <json>`, which is that
+  process's command line. The shell owns `shell.json` and this is the only
+  sanctioned way to write it. It is momentary, and it is one more reason the
+  answer to "where do I put the token" is `apiKeyCommand`. The warning attached
+  to `apiKey` says so.
 
 Two more places a token could get out, both closed:
 
