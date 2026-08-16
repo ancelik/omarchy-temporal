@@ -1622,7 +1622,7 @@ function fleetEntries(serverStates, nowMs) {
       // "…" only when there is genuinely nothing to show yet; a refresh over
       // data we already have should not blank the row.
       trailing: !reachable
-        ? "unreachable"
+        ? failureWord(server.errorKind)
         : (server.pending && totals.namespaces === 0 ? "…" : totals.running + " running"),
       trailingSub: !reachable
         ? String(server.error || "")
@@ -1644,6 +1644,20 @@ function fleetEntries(serverStates, nowMs) {
   }))
 
   return entries
+}
+
+// The word in the corner of a server row that is not working. "unreachable" on
+// a rejected token is a lie that costs an hour of tcpdump, so the kind decides
+// the word and the error itself goes underneath.
+function failureWord(kind) {
+  switch (String(kind || "")) {
+  case "auth": return "token rejected"
+  case "denied": return "no permission"
+  case "config": return "misconfigured"
+  case "tls": return "tls failed"
+  case "timeout": return "no answer"
+  }
+  return "unreachable"
 }
 
 // --- one server -----------------------------------------------------------------------------
@@ -1677,6 +1691,11 @@ function serverEntries(server, nowMs) {
     entries.push(noteEntry("", String(server.error || "unreachable"), "bad"))
     return entries
   }
+
+  // Said out loud rather than left to be inferred from a short list: a server
+  // that fell back to its configured namespaces, or that had to move onto the
+  // cli transport, is showing something other than what was asked for.
+  if (server.notice) entries.push(noteEntry("", String(server.notice), "dim"))
 
   var namespaces = isList(server.namespaces) ? server.namespaces : []
   if (namespaces.length === 0) {

@@ -61,20 +61,29 @@ Item {
     var xhr = new XMLHttpRequest()
     xhr.onreadystatechange = function () {
       if (xhr.readyState !== XMLHttpRequest.DONE) return
+
+      // A server that refuses the probe is still a server. Treating a 401 or a
+      // 403 as "nothing here" is why a protected deployment used to be
+      // invisible on the one screen whose job is finding servers.
+      if (xhr.status === 401 || xhr.status === 403) {
+        addHttpCandidate(port, base, null, true)
+        return
+      }
       if (xhr.status < 200 || xhr.status >= 300) return
+
       var info = null
       try {
         info = Model.parseClusterInfo(JSON.parse(xhr.responseText))
       } catch (error) {
         return
       }
-      addHttpCandidate(port, base, info)
+      addHttpCandidate(port, base, info, false)
     }
     xhr.open("GET", base + "/api/v1/cluster-info")
     xhr.send()
   }
 
-  function addHttpCandidate(port, base, info) {
+  function addHttpCandidate(port, base, info, needsAuth) {
     var found = httpFound.slice()
     for (var i = 0; i < found.length; i++) if (found[i].url === base) return
     found.push({
@@ -84,7 +93,8 @@ Item {
       // Probed rather than assumed, so a non-standard layout just means no link.
       uiUrl: "",
       version: info ? info.serverVersion : "",
-      clusterName: info ? info.clusterName : ""
+      clusterName: info ? info.clusterName : "",
+      needsAuth: needsAuth === true
     })
     found.sort(function (a, b) { return a.port - b.port })
     httpFound = found
@@ -110,15 +120,27 @@ Item {
   Process {
     id: discovery
 
+    property string spec: ""
+
+    // Same stdin handshake the poll uses. Discovery carries no credentials
+    // today, but there is no second way to invoke the collector worth keeping
+    // alive just for this.
     function launch() {
-      var spec = JSON.stringify({
+      spec = JSON.stringify({
         mode: "discover",
         cli: root.cliPath,
         addresses: root.grpcAddresses,
         timeoutSec: 6
       })
-      command = ["bash", "-lc", "exec python3 \"$0\" \"$1\"", root.collectorPath, spec]
+      command = ["bash", "-lc", "exec python3 \"$0\" -", root.collectorPath]
+      stdinEnabled = true
       running = true
+    }
+
+    onStarted: {
+      write(spec)
+      stdinEnabled = false
+      spec = ""
     }
 
     stdout: StdioCollector { id: discoveryOut; waitForEnd: true }
@@ -209,13 +231,51 @@ Item {
   // `omtemporal add|remove|list` calls straight into these, so the terminal and
   // the panel cannot drift apart in how they interpret an address.
 
+  // Options a server can be added with, spelled the way shell.json spells them
+  // so there is one vocabulary to learn. `header` is repeatable and takes
+  // "Name: value", which is how a proxy's own instructions write it.
+  readonly property var addOptions: ({
+    apiKey: "string", apiKeyCommand: "string", apiKeyTtlSec: "string",
+    uiUrl: "string", namespaces: "string", transport: "string",
+    tls: "bool", tlsCertPath: "string", tlsKeyPath: "string", tlsCaPath: "string",
+    tlsServerName: "string", tlsDisableHostVerification: "bool",
+    header: "header"
+  })
+
   function addFromCli(spec) {
     var value = String(spec || "").trim()
-    if (value === "") return "usage: add <url|host:port|profile:NAME> [label]"
+    if (value === "") return "usage: add <url|host:port|profile:NAME> [label] [option=value ...]"
 
     var parts = value.split(/\s+/)
     var target = parts[0]
-    var label = parts.length > 1 ? parts.slice(1).join(" ") : ""
+
+    // Anything after the target that looks like a known option is one; the rest
+    // is the label. Keeps `add host:7233 my prod box` working unchanged.
+    var options = {}
+    var headers = {}
+    var words = []
+    var warnings = []
+    for (var i = 1; i < parts.length; i++) {
+      var cut = parts[i].indexOf("=")
+      var name = cut > 0 ? parts[i].substring(0, cut) : ""
+      if (cut <= 0 || !addOptions[name]) {
+        words.push(parts[i])
+        continue
+      }
+      var raw = parts[i].substring(cut + 1)
+      if (addOptions[name] === "header") {
+        var split = raw.indexOf(":") === -1 ? raw.indexOf("=") : raw.indexOf(":")
+        if (split > 0) headers[raw.substring(0, split).trim()] = raw.substring(split + 1).trim()
+        continue
+      }
+      options[name] = addOptions[name] === "bool" ? (raw === "true" || raw === "1") : raw
+    }
+    if (options.apiKey) {
+      // It is already too late to keep it out of the shell history, but it is
+      // not too late to say so before it goes into shell.json in the clear.
+      warnings.push("apiKey is now in your shell history and in shell.json; apiKeyCommand avoids both")
+    }
+    var label = words.join(" ")
 
     var config = null
     if (target.indexOf("profile:") === 0) {
@@ -229,9 +289,27 @@ Item {
       config.label = label || target
     }
 
+    for (var key in options) config[key] = options[key]
+    if (Object.keys(headers).length > 0) config.headers = headers
+
     if (alreadyConfigured(config)) return "already configured: " + config.label
+
+    // Normalized before the verdict so mTLS moving the entry onto the cli
+    // transport, or a config that cannot work at all, is reported now rather
+    // than discovered as an empty panel later.
+    var normalized = Model.normalizeServer(config, servers.length)
+    if (!normalized) return "cannot read that as a server: " + target
+    var fatal = Model.hasConfigError(normalized)
+    if (fatal !== "") return "not added — " + fatal
+
     addServer(config)
-    return "added " + config.label + " (" + config.transport + ")"
+    var lines = ["added " + normalized.label + " (" + normalized.transport + ", "
+      + Model.authSummary(normalized).text + ")"]
+    if (normalized.transportNote) lines.push(normalized.transportNote)
+    var issues = Model.authConfigIssues(normalized)
+    for (var j = 0; j < issues.length; j++) lines.push(issues[j].level + ": " + issues[j].text)
+    for (var w = 0; w < warnings.length; w++) lines.push("warn: " + warnings[w])
+    return lines.join("\n")
   }
 
   function removeByLabel(label) {
@@ -250,7 +328,12 @@ Item {
     if (servers.length === 0) return "no servers configured"
     var lines = []
     for (var i = 0; i < servers.length; i++) {
-      lines.push([servers[i].label, servers[i].transport, Model.serverAddressText(servers[i])].join("\t"))
+      lines.push([
+        servers[i].label,
+        servers[i].transport,
+        Model.serverAddressText(servers[i]),
+        Model.authSummary(servers[i]).text
+      ].join("\t"))
     }
     return lines.join("\n")
   }
@@ -267,17 +350,26 @@ Item {
     } else {
       for (var i = 0; i < servers.length; i++) {
         var server = servers[i]
+        var summary = Model.authSummary(server)
         out.push(Model.entry({
           section: "CONFIGURED SERVERS",
           sectionHint: "Enter removes one.",
           kind: "server",
           title: server.label,
-          subtitle: Model.serverAddressText(server) + "  ·  " + server.transport,
+          subtitle: Model.serverAddressText(server) + "  ·  " + server.transport
+            + (summary.text === "none" ? "" : "  ·  " + summary.text),
           trailing: "remove",
           tone: "dim",
           action: "removeServer",
           payload: { index: i }
         }))
+        // Anything already known to be wrong with this server's credentials,
+        // shown where the server is rather than saved for the first poll.
+        var issues = Model.authConfigIssues(server)
+        for (var k = 0; k < issues.length; k++) {
+          out.push(Model.noteEntry("CONFIGURED SERVERS", issues[k].text,
+            issues[k].level === "error" ? "bad" : "dim"))
+        }
       }
     }
 
@@ -296,10 +388,12 @@ Item {
         sectionHint: "Servers answering on this machine. HTTP is the faster transport.",
         kind: "server",
         title: candidate.url,
-        subtitle: candidate.clusterName
-          ? candidate.clusterName + "  ·  Temporal " + candidate.version
-          : "Temporal HTTP API",
-        trailing: "http",
+        subtitle: candidate.needsAuth
+          ? "Temporal HTTP API — refused the probe, so it wants credentials"
+          : (candidate.clusterName
+            ? candidate.clusterName + "  ·  Temporal " + candidate.version
+            : "Temporal HTTP API"),
+        trailing: candidate.needsAuth ? "http · auth" : "http",
         action: "addHttp",
         payload: candidate
       }))
