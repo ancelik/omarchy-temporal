@@ -59,11 +59,16 @@ Each server is reached one of two ways, chosen explicitly per server.
 | How | Temporal's HTTP API, straight from the shell | shells out to `temporal … -o json` |
 | Needs | `httpPort` enabled server-side | the `temporal` CLI on PATH |
 | Speed | fast; polls as often as you like | a process start per poll, so no faster than 15s |
-| Auth | API keys and bearer tokens | whatever the CLI supports, including mTLS and Temporal Cloud profiles |
+| Auth | API keys, bearer tokens, custom headers | all of that, plus mTLS, `temporal.toml` profiles and Temporal Cloud |
 
 Prefer `http` where it is available. Reach for `cli` when the HTTP listener is
-off — which is the default for most real deployments — or when the connection
-needs client certificates, which the shell's HTTP client cannot present.
+off — which is the default for most real deployments — when the connection needs
+client certificates, which the shell's HTTP client cannot present, or for
+Temporal Cloud, which publishes no HTTP API. A server configured with a client
+certificate is moved onto `cli` automatically and told you so.
+
+See [AUTH.md](AUTH.md) for every mechanism, which transport each needs, and
+worked examples including Temporal Cloud and mTLS.
 
 Both go through the same parsers, so the two render identically.
 `testbed/parity-test.mjs` exists to keep that true.
@@ -92,9 +97,21 @@ widget's entry lives in `~/.config/omarchy/shell.json`:
 | `address` | gRPC `host:port`, for `cli`. |
 | `profile` | A profile name from `temporal.toml`, for `cli`. Brings its own address, credentials and TLS. |
 | `uiUrl` | Web UI base, used to build links. Falls back to `url`. |
-| `namespaces` | Pin the namespaces to poll. Omit to discover them. Also the way to work with a token that cannot call ListNamespaces. |
-| `apiKey` | Sent as `Authorization: Bearer`. |
-| `apiKeyCommand` | Shell command whose stdout is the key, run once per session — keeps tokens out of `shell.json`. |
+| `namespaces` | Pin the namespaces to poll. Omit to discover them. Also the way to work with a credential that cannot call `ListNamespaces`. |
+| `apiKey` | Bearer token, inline. Works, warns — `shell.json` is not a secret store. |
+| `apiKeyCommand` | Shell command whose stdout is the token. The preferred way: `pass`, `gopass`, `secret-tool`, `op`. |
+| `apiKeyTtlSec` | How long a resolved token is reused before the command runs again. Default 900. `0` resolves once and keeps it. |
+| `headers` | Extra headers on every request, as a map or as `"Name: value"` lines. For Cloudflare Access and friends. |
+| `tls` | Force base TLS on or off (`cli`). Omit to let the CLI decide — it turns TLS on by itself when an API key is present. |
+| `tlsCertPath` | Client certificate (`cli`). Its presence moves the server onto the `cli` transport. |
+| `tlsKeyPath` | The certificate's key (`cli`). Required alongside `tlsCertPath`. |
+| `tlsCaPath` | CA to verify the server with (`cli`). |
+| `tlsServerName` | Override the expected TLS server name (`cli`). |
+| `tlsDisableHostVerification` | Skip checking the server's identity (`cli`). Warned about. |
+
+Credentials never reach a command line: the collector spec goes in on stdin and
+`temporal` gets its key from the environment. See
+[Secrets and argv](AUTH.md#secrets-and-argv).
 
 > **You may see `"servers": {"list": [...]}`.** That is what the setup screen
 > writes. The shell's `setBarWidget` IPC silently drops a setting whose value is
@@ -144,6 +161,7 @@ omtemporal list                               # configured servers
 omtemporal add http://localhost:7243 local    # HTTP
 omtemporal add localhost:7233                 # gRPC, via the CLI
 omtemporal add profile:prod                   # a temporal.toml profile
+omtemporal add https://temporal.corp:7243 prod apiKeyCommand='pass temporal/prod'
 omtemporal remove local
 omtemporal status
 omtemporal doctor                             # why is the widget empty
@@ -154,8 +172,12 @@ omtemporal open namespace 0 orders            # jump straight to a level
 share one implementation and cannot drift apart.
 
 `omtemporal doctor` is the first thing to run when something looks wrong: it
-checks the shell, the widget, the CLI, every server's reachability, and whether
-each HTTP server's API is actually enabled.
+checks the shell, the widget, the CLI, every server's reachability, whether each
+HTTP server's API is actually enabled — and, since that is now the leading cause
+of an empty panel, its credentials. What each server carries, anything already
+known to be wrong with the way it is configured, whether the certificates it
+names exist and are readable, and whether the key command runs. It reports how
+many characters the command produced, never the token.
 
 `omtemporal open` is useful as a keybind — point it at the namespace you care
 about and skip the drilling.
@@ -178,6 +200,7 @@ omarchy-shell temporal toggle
 omarchy-shell temporal refresh
 omarchy-shell temporal status
 omarchy-shell temporal servers      # per-server reachability
+omarchy-shell temporal auth         # per-server credentials, for doctor
 omarchy-shell temporal openAt '{"level":"namespace","serverIndex":0,"namespace":"orders"}'
 ```
 
@@ -191,6 +214,10 @@ Activity retries forever, so the Activity view always has something to show. See
 ```bash
 bin/dev-install               # validate, copy into ~/.config/omarchy/plugins/, rescan
 node testbed/parity-test.mjs  # assert HTTP and CLI parse identically
+
+# An authenticating front door, for the 401/403 and namespace-fallback paths.
+# `temporal server start-dev` cannot enforce anything, so a proxy stands in.
+docker compose -f testbed/compose.yaml --profile auth up -d authproxy
 ```
 
 Saving a file under `~/.config/omarchy/plugins/` hot-reloads plugin QML, but the
@@ -211,6 +238,7 @@ journalctl --user -f | grep com.anilcelik.temporal
 | `Model.js` | Parsing, rollups, formatting, and the entry builders that decide what each level contains |
 | `EntryList.qml` / `PrimitiveRow.qml` | The one renderer every level uses |
 | `SetupView.qml` | Discovery, onboarding, persistence |
+| `AUTH.md` | Every credential the plugin can present, and where to keep it |
 | `collect.py` | CLI transport — runs `temporal`, returns raw payloads for `Model.js` to parse |
 | `TemporalIcon.qml` | The mark, drawn on a Canvas so it stays sharp at bar sizes |
 
@@ -222,7 +250,9 @@ builders testable without a running shell.
 ## Limits
 
 - **mTLS needs the `cli` transport.** QML's `XMLHttpRequest` cannot present a
-  client certificate.
+  client certificate, so a server configured with one is moved onto `cli`.
+- **Temporal Cloud needs the `cli` transport.** Cloud publishes no documented
+  HTTP API; see [AUTH.md](AUTH.md#temporal-cloud--cli-transport-only).
 - **Standalone Activities are not shown.** The API exposes them, but the
   Activity view is built on `pendingActivities` from a Workflow description,
   which is the one that answers why something is stuck.
