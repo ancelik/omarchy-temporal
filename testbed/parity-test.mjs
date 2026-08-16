@@ -581,6 +581,9 @@ check("and every record names its type",
 
 console.log("\ncollector argv hygiene")
 
+// PYTHONDONTWRITEBYTECODE below, or importing the collector drops a
+// __pycache__ into the plugin directory, which dev-install then copies into
+// ~/.config/omarchy/plugins along with everything else.
 const argvProbe = JSON.parse(execFileSync("python3", ["-c", `
 import json, sys
 sys.path.insert(0, ${JSON.stringify(join(here, ".."))})
@@ -599,7 +602,7 @@ print(json.dumps({
     "headerInEnv": env.get("TEMPORAL_GRPC_META_CF_ACCESS_CLIENT_SECRET"),
     "redacted": collect.redact("temporal --api-key SENTINEL-API-KEY failed", collect.secrets_of(spec)),
 }))
-`], { encoding: "utf8" }))
+`], { encoding: "utf8", env: { ...process.env, PYTHONDONTWRITEBYTECODE: "1" } }))
 
 check("the api key never reaches a command line", argvProbe.argv.includes("SENTINEL-API-KEY"), false)
 check("nor does a proxy header's secret", argvProbe.argv.includes("SENTINEL-CF-SECRET"), false)
