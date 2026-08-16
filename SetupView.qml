@@ -61,20 +61,29 @@ Item {
     var xhr = new XMLHttpRequest()
     xhr.onreadystatechange = function () {
       if (xhr.readyState !== XMLHttpRequest.DONE) return
+
+      // A server that refuses the probe is still a server. Treating a 401 or a
+      // 403 as "nothing here" is why a protected deployment used to be
+      // invisible on the one screen whose job is finding servers.
+      if (xhr.status === 401 || xhr.status === 403) {
+        addHttpCandidate(port, base, null, true)
+        return
+      }
       if (xhr.status < 200 || xhr.status >= 300) return
+
       var info = null
       try {
         info = Model.parseClusterInfo(JSON.parse(xhr.responseText))
       } catch (error) {
         return
       }
-      addHttpCandidate(port, base, info)
+      addHttpCandidate(port, base, info, false)
     }
     xhr.open("GET", base + "/api/v1/cluster-info")
     xhr.send()
   }
 
-  function addHttpCandidate(port, base, info) {
+  function addHttpCandidate(port, base, info, needsAuth) {
     var found = httpFound.slice()
     for (var i = 0; i < found.length; i++) if (found[i].url === base) return
     found.push({
@@ -84,7 +93,8 @@ Item {
       // Probed rather than assumed, so a non-standard layout just means no link.
       uiUrl: "",
       version: info ? info.serverVersion : "",
-      clusterName: info ? info.clusterName : ""
+      clusterName: info ? info.clusterName : "",
+      needsAuth: needsAuth === true
     })
     found.sort(function (a, b) { return a.port - b.port })
     httpFound = found
@@ -110,15 +120,27 @@ Item {
   Process {
     id: discovery
 
+    property string spec: ""
+
+    // Same stdin handshake the poll uses. Discovery carries no credentials
+    // today, but there is no second way to invoke the collector worth keeping
+    // alive just for this.
     function launch() {
-      var spec = JSON.stringify({
+      spec = JSON.stringify({
         mode: "discover",
         cli: root.cliPath,
         addresses: root.grpcAddresses,
         timeoutSec: 6
       })
-      command = ["bash", "-lc", "exec python3 \"$0\" \"$1\"", root.collectorPath, spec]
+      command = ["bash", "-lc", "exec python3 \"$0\" -", root.collectorPath]
+      stdinEnabled = true
       running = true
+    }
+
+    onStarted: {
+      write(spec)
+      stdinEnabled = false
+      spec = ""
     }
 
     stdout: StdioCollector { id: discoveryOut; waitForEnd: true }
@@ -210,28 +232,23 @@ Item {
   // the panel cannot drift apart in how they interpret an address.
 
   function addFromCli(spec) {
-    var value = String(spec || "").trim()
-    if (value === "") return "usage: add <url|host:port|profile:NAME> [label]"
+    // Parsed in Model.js so the option grammar is checkable without a shell.
+    var parsed = Model.parseAddSpec(spec)
+    if (!parsed.ok) return parsed.message
 
-    var parts = value.split(/\s+/)
-    var target = parts[0]
-    var label = parts.length > 1 ? parts.slice(1).join(" ") : ""
-
-    var config = null
-    if (target.indexOf("profile:") === 0) {
-      config = { profile: target.substring(8), transport: "cli" }
-      config.label = label || config.profile
-    } else if (target.match(/^https?:\/\//)) {
-      config = { url: target, transport: "http" }
-      config.label = label || Model.hostOf(target)
-    } else {
-      config = { address: target, transport: "cli" }
-      config.label = label || target
-    }
-
+    var config = parsed.config
     if (alreadyConfigured(config)) return "already configured: " + config.label
+
+    // Normalized before the verdict, so mTLS moving the entry onto the cli
+    // transport -- or a config that cannot work at all -- is reported now
+    // rather than discovered later as an empty panel.
+    var normalized = Model.normalizeServer(config, servers.length)
+    if (!normalized) return "cannot read that as a server"
+    var fatal = Model.hasConfigError(normalized)
+    if (fatal !== "") return "not added — " + fatal
+
     addServer(config)
-    return "added " + config.label + " (" + config.transport + ")"
+    return Model.addVerdict(normalized, parsed.warnings)
   }
 
   function removeByLabel(label) {
@@ -250,7 +267,12 @@ Item {
     if (servers.length === 0) return "no servers configured"
     var lines = []
     for (var i = 0; i < servers.length; i++) {
-      lines.push([servers[i].label, servers[i].transport, Model.serverAddressText(servers[i])].join("\t"))
+      lines.push([
+        servers[i].label,
+        servers[i].transport,
+        Model.serverAddressText(servers[i]),
+        Model.authSummary(servers[i]).text
+      ].join("\t"))
     }
     return lines.join("\n")
   }
@@ -267,17 +289,26 @@ Item {
     } else {
       for (var i = 0; i < servers.length; i++) {
         var server = servers[i]
+        var summary = Model.authSummary(server)
         out.push(Model.entry({
           section: "CONFIGURED SERVERS",
           sectionHint: "Enter removes one.",
           kind: "server",
           title: server.label,
-          subtitle: Model.serverAddressText(server) + "  ·  " + server.transport,
+          subtitle: Model.serverAddressText(server) + "  ·  " + server.transport
+            + (summary.text === "none" ? "" : "  ·  " + summary.text),
           trailing: "remove",
           tone: "dim",
           action: "removeServer",
           payload: { index: i }
         }))
+        // Anything already known to be wrong with this server's credentials,
+        // shown where the server is rather than saved for the first poll.
+        var issues = Model.authConfigIssues(server)
+        for (var k = 0; k < issues.length; k++) {
+          out.push(Model.noteEntry("CONFIGURED SERVERS", issues[k].text,
+            issues[k].level === "error" ? "bad" : "dim"))
+        }
       }
     }
 
@@ -296,10 +327,12 @@ Item {
         sectionHint: "Servers answering on this machine. HTTP is the faster transport.",
         kind: "server",
         title: candidate.url,
-        subtitle: candidate.clusterName
-          ? candidate.clusterName + "  ·  Temporal " + candidate.version
-          : "Temporal HTTP API",
-        trailing: "http",
+        subtitle: candidate.needsAuth
+          ? "Temporal HTTP API — refused the probe, so it wants credentials"
+          : (candidate.clusterName
+            ? candidate.clusterName + "  ·  Temporal " + candidate.version
+            : "Temporal HTTP API"),
+        trailing: candidate.needsAuth ? "http · auth" : "http",
         action: "addHttp",
         payload: candidate
       }))

@@ -270,6 +270,20 @@ function normalizeServer(entry, index) {
   // rejected.
   var transport = String(value.transport || "").toLowerCase()
   if (TRANSPORTS.indexOf(transport) === -1) transport = url !== "" ? "http" : "cli"
+
+  // A client certificate is presented during the TLS handshake, and QML's
+  // XMLHttpRequest has no way to hand one over. An entry that carries one is
+  // moved onto the cli transport rather than left to fail its handshake once a
+  // tick with an error nobody can act on. It needs somewhere to dial, though --
+  // the HTTP port is not the gRPC port -- so without an address or a profile it
+  // stays as configured and authConfigIssues() reports it as a fixable error.
+  var tls = normalizeTls(value)
+  var transportNote = ""
+  if (tls.mutual && transport === "http" && (address !== "" || profile !== "")) {
+    transport = "cli"
+    transportNote = "using the cli transport: a client certificate cannot be sent over http from the shell"
+  }
+
   if (transport === "http" && url === "") return null
   if (transport === "cli" && address === "" && profile === "") {
     // A CLI server described only by its HTTP url can still be reached: hand
@@ -299,8 +313,23 @@ function normalizeServer(entry, index) {
     uiUrl: trimSlashes(value.uiUrl || value.ui || ""),
     namespaces: namespaces,
     apiKey: String(value.apiKey || ""),
-    apiKeyCommand: String(value.apiKeyCommand || "")
+    apiKeyCommand: String(value.apiKeyCommand || ""),
+    // Tokens expire, usually on the hour. Zero means "resolve once and keep
+    // it", which is what this plugin used to do unconditionally.
+    apiKeyTtlSec: ttlSetting(value.apiKeyTtlSec),
+    headers: normalizeHeaders(value.headers),
+    tls: tls,
+    transportNote: transportNote
   }
+}
+
+var DEFAULT_KEY_TTL_SEC = 900
+
+function ttlSetting(raw) {
+  if (raw === undefined || raw === null || raw === "") return DEFAULT_KEY_TTL_SEC
+  var n = parseInt(String(raw), 10)
+  if (!isFinite(n) || n < 0) return DEFAULT_KEY_TTL_SEC
+  return n
 }
 
 // What onboarding writes back to shell.json. Only keys that carry a value
@@ -315,6 +344,17 @@ function serverToConfig(server) {
   if (server.namespaces && server.namespaces.length > 0) out.namespaces = server.namespaces
   if (server.apiKey) out.apiKey = server.apiKey
   if (server.apiKeyCommand) out.apiKeyCommand = server.apiKeyCommand
+  if (server.apiKeyCommand && server.apiKeyTtlSec !== DEFAULT_KEY_TTL_SEC) {
+    out.apiKeyTtlSec = server.apiKeyTtlSec
+  }
+  if (headerCount(server.headers) > 0) out.headers = server.headers
+  var tls = server.tls || normalizeTls({})
+  if (tls.certPath) out.tlsCertPath = tls.certPath
+  if (tls.keyPath) out.tlsKeyPath = tls.keyPath
+  if (tls.caPath) out.tlsCaPath = tls.caPath
+  if (tls.serverName) out.tlsServerName = tls.serverName
+  if (tls.disableHostVerification) out.tlsDisableHostVerification = true
+  if (tls.enabled !== null) out.tls = tls.enabled
   return out
 }
 
@@ -341,6 +381,678 @@ function serverAddressText(server) {
 // bury the user's own namespaces under noise they cannot act on.
 function isInternalNamespace(name) {
   return String(name || "") === "temporal-system"
+}
+
+// --- authentication and authorization -------------------------------------------
+//
+// Everything here is a decision, not an action: which credential a server
+// carries, whether that credential is even expressible over the transport it
+// asked for, what a rejection actually means, and what to do when a token can
+// read a namespace but not list them. The transports call into this so both
+// reach the same conclusion from the same evidence.
+
+// Header names are case-insensitive on the wire but not in a JS object, so they
+// are folded to one canonical spelling. Anything the caller sets wins over the
+// defaults except Authorization, which is built from apiKey when one exists.
+var RESERVED_HEADERS = { accept: true, "content-length": true, host: true }
+
+// Accepts the shapes people write headers in: a map, or a list of
+// "Name: value" / "Name=value" strings, which is what gets pasted out of a
+// proxy's setup instructions.
+function normalizeHeaders(raw) {
+  var out = {}
+  if (!raw) return out
+
+  if (isList(raw)) {
+    for (var i = 0; i < raw.length; i++) {
+      var line = String(raw[i] || "")
+      var cut = line.indexOf(":")
+      if (cut === -1) cut = line.indexOf("=")
+      if (cut <= 0) continue
+      putHeader(out, line.substring(0, cut), line.substring(cut + 1))
+    }
+    return out
+  }
+
+  if (typeof raw === "object") {
+    for (var name in raw) putHeader(out, name, raw[name])
+  }
+  return out
+}
+
+function putHeader(map, name, value) {
+  var key = String(name || "").trim()
+  if (key === "") return
+  // Setting Accept or Host from config breaks the request in ways that look
+  // like a server fault, so those are the two the user does not get to own.
+  if (RESERVED_HEADERS[key.toLowerCase()] === true) return
+  map[key] = String(value === undefined || value === null ? "" : value).trim()
+}
+
+function headerCount(headers) {
+  var n = 0
+  for (var name in headers) n += 1
+  return n
+}
+
+// The TLS material a server presents, as the `temporal` CLI names it. The names
+// are copied from the flags on purpose: someone who has a working
+// `temporal --tls-cert-path ...` command should be able to transcribe it.
+function normalizeTls(value) {
+  var tls = {
+    certPath: expandHome(value.tlsCertPath || value.tlsCert || ""),
+    keyPath: expandHome(value.tlsKeyPath || value.tlsKey || ""),
+    caPath: expandHome(value.tlsCaPath || value.tlsCa || ""),
+    serverName: String(value.tlsServerName || "").trim(),
+    disableHostVerification: value.tlsDisableHostVerification === true,
+    // `temporal` switches TLS on by itself the moment an api key or any tls
+    // option is present, which is right everywhere except a cleartext proxy on
+    // localhost. null means "let the CLI decide", which is what it should do.
+    enabled: triState(value.tls)
+  }
+  // A CA on its own is server verification, not client identity. Only a
+  // cert+key pair is mTLS, and only mTLS is the thing XMLHttpRequest cannot do.
+  tls.mutual = tls.certPath !== "" || tls.keyPath !== ""
+  tls.any = tls.mutual || tls.caPath !== "" || tls.serverName !== "" || tls.disableHostVerification
+  return tls
+}
+
+// ~/certs/... is how people write paths, and neither QML nor `temporal` expands
+// it. Done here so the path in the panel is the path that was actually used.
+function triState(value) {
+  if (value === undefined || value === null || value === "") return null
+  return value === true || value === "true"
+}
+
+function expandHome(raw) {
+  var path = String(raw || "").trim()
+  if (path === "~") return homeDir()
+  if (path.indexOf("~/") === 0) return homeDir() + path.substring(1)
+  return path
+}
+
+var HOME_DIR = ""
+
+function homeDir() {
+  return HOME_DIR
+}
+
+function setHomeDir(path) {
+  HOME_DIR = String(path || "").replace(/\/+$/, "")
+}
+
+// What a server's credentials add up to, in the order they matter. `text` is
+// the one-liner the panel and `omtemporal doctor` both show; nothing here ever
+// contains the secret itself.
+function authSummary(server) {
+  var modes = []
+  if (!server) return { modes: modes, text: "none", requiresCli: false, reason: "" }
+
+  if (String(server.apiKey || "") !== "") modes.push("apiKey")
+  else if (String(server.apiKeyCommand || "") !== "") modes.push("apiKeyCommand")
+  var tls = server.tls || normalizeTls({})
+  if (tls.mutual) modes.push("mtls")
+  else if (tls.any) modes.push("tls")
+  if (headerCount(server.headers) > 0) modes.push("headers")
+  if (String(server.profile || "") !== "") modes.push("profile")
+
+  var parts = []
+  for (var i = 0; i < modes.length; i++) parts.push(AUTH_MODE_TEXT[modes[i]] || modes[i])
+  if (modes.indexOf("headers") !== -1) {
+    parts[parts.length - 1] = plural(headerCount(server.headers), "custom header")
+  }
+
+  return {
+    modes: modes,
+    text: parts.length > 0 ? parts.join(" · ") : "none",
+    // A client certificate has to be presented during the handshake, and QML's
+    // XMLHttpRequest has no way to hand one over. That is a hard fact about the
+    // transport, not a missing feature here.
+    requiresCli: tls.mutual,
+    reason: tls.mutual ? "a client certificate can only be presented by the cli transport" : ""
+  }
+}
+
+var AUTH_MODE_TEXT = {
+  apiKey: "api key (inline)",
+  apiKeyCommand: "api key (command)",
+  mtls: "mTLS",
+  tls: "custom tls",
+  headers: "custom headers",
+  profile: "cli profile"
+}
+
+// Problems worth telling the user about before a request is ever made. Errors
+// stop the server from being polled at all -- there is no point earning a
+// handshake failure once a tick when the config cannot work. Warnings are
+// things that will work and probably should not.
+function authConfigIssues(server) {
+  var issues = []
+  if (!server) return issues
+
+  var tls = server.tls || normalizeTls({})
+
+  if (tls.mutual && (tls.certPath === "" || tls.keyPath === "")) {
+    issues.push(issue("error",
+      "mTLS needs both tlsCertPath and tlsKeyPath; only "
+        + (tls.certPath !== "" ? "the certificate" : "the key") + " is set"))
+  }
+
+  if (tls.mutual && server.transport === "http") {
+    // Reached only when the entry gives no gRPC address to switch to;
+    // normalizeServer moves the rest onto the cli transport by itself.
+    issues.push(issue("error",
+      "mTLS needs the cli transport, and this server has no gRPC address to use. "
+        + "Add \"address\": \"host:7233\" (or a \"profile\")."))
+  }
+
+  if (String(server.apiKey || "") !== "" && String(server.apiKeyCommand || "") !== "") {
+    issues.push(issue("warn", "apiKey and apiKeyCommand are both set; the inline apiKey wins"))
+  }
+
+  if (String(server.apiKey || "") !== "") {
+    // Both halves of this matter. shell.json is not a secret store, and saving
+    // it goes through `omarchy-shell shell setBarWidget <id> servers <json>`,
+    // which puts the value on that process's command line where anyone can read
+    // it. Neither is fixable from here; not needing an inline key is.
+    issues.push(issue("warn",
+      "apiKey is stored in plain text in shell.json and passed on a command line when it is saved; "
+        + "apiKeyCommand avoids both"))
+  }
+
+  // A bearer token over cleartext http is handed to anything on the path. Local
+  // loopback is the exception, and it is the common one, so it is not flagged.
+  if (server.transport === "http" && server.url.indexOf("http://") === 0 && !isLoopback(server.url)
+      && (String(server.apiKey || "") !== "" || String(server.apiKeyCommand || "") !== ""
+        || headerCount(server.headers) > 0)) {
+    issues.push(issue("warn", "credentials are sent over plain http to " + hostOf(server.url)))
+  }
+
+  if (tls.disableHostVerification) {
+    issues.push(issue("warn", "tlsDisableHostVerification is on; the server's identity is not checked"))
+  }
+
+  if (server.transport === "http" && isCloudEndpoint(server.url)) {
+    issues.push(issue("error",
+      "Temporal Cloud does not publish an HTTP API. Use the cli transport with "
+        + "\"address\": \"<namespace>.<account>.tmprl.cloud:7233\"."))
+  }
+
+  if (server.transport === "cli" && isCloudEndpoint(server.address)
+      && server.namespaces.length > 0) {
+    for (var n = 0; n < server.namespaces.length; n++) {
+      // On Cloud the namespace *is* name.accountid everywhere -- CLI, SDK and
+      // API. A bare name earns a NamespaceNotFound that reads like the
+      // namespace was deleted.
+      if (server.namespaces[n].indexOf(".") === -1) {
+        issues.push(issue("warn",
+          "Temporal Cloud namespaces are named <namespace>.<account>; \""
+            + server.namespaces[n] + "\" has no account suffix"))
+      }
+    }
+  }
+
+  if (tls.any && server.transport === "http" && !tls.mutual) {
+    issues.push(issue("warn",
+      "tls settings are ignored on the http transport; the shell's http client uses the system trust store"))
+  }
+
+  return issues
+}
+
+function issue(level, text) {
+  return { level: level, text: String(text) }
+}
+
+function hasConfigError(server) {
+  var issues = authConfigIssues(server)
+  for (var i = 0; i < issues.length; i++) if (issues[i].level === "error") return issues[i].text
+  return ""
+}
+
+// Temporal Cloud namespace and regional endpoints. Cloud has no documented
+// HTTP API -- probing one gets a 401 from the auth proxy in front of it, which
+// says an authenticating frontend is listening and nothing at all about whether
+// /api/v1 is routed. So the http transport is not offered for these.
+function isCloudEndpoint(target) {
+  var host = hostOf(target).toLowerCase()
+  return /(^|\.)tmprl\.cloud(:|$)/.test(host) || /(^|\.)api\.temporal\.io(:|$)/.test(host)
+}
+
+function isLoopback(url) {
+  var host = hostOf(url).split(":")[0]
+  return host === "localhost" || host === "127.0.0.1" || host === "::1" || host === "[::1]"
+}
+
+// The headers an http request carries. Built here rather than in Service.qml so
+// the precedence -- defaults, then the user's, then the api key -- is one
+// testable rule instead of a sequence of setRequestHeader calls.
+function httpHeaders(server, apiKey) {
+  var headers = { Accept: "application/json" }
+  var custom = (server && server.headers) || {}
+  for (var name in custom) headers[name] = custom[name]
+
+  var key = String(apiKey || "")
+  // A hand-written Authorization header (Basic, or a token shape Temporal does
+  // not call an api key) is left alone when there is no api key to override it.
+  if (key !== "") headers.Authorization = "Bearer " + key
+  return headers
+}
+
+// The auth half of the collector spec. collect.py turns this into flags and
+// environment; keeping the decision here means the CLI and HTTP paths cannot
+// disagree about what a server's credentials are.
+function authSpec(server, apiKey) {
+  var tls = (server && server.tls) || normalizeTls({})
+  return {
+    apiKey: String(apiKey || ""),
+    headers: (server && server.headers) || {},
+    tlsCertPath: tls.certPath,
+    tlsKeyPath: tls.keyPath,
+    tlsCaPath: tls.caPath,
+    tlsServerName: tls.serverName,
+    tlsDisableHostVerification: tls.disableHostVerification === true,
+    tls: tls.enabled
+  }
+}
+
+// --- the `add` command line ---------------------------------------------------------
+
+// Options a server can be added with, spelled exactly the way shell.json spells
+// them so there is one vocabulary to learn rather than two.
+var ADD_OPTIONS = {
+  apiKey: "string", apiKeyCommand: "string", apiKeyTtlSec: "string",
+  uiUrl: "string", namespaces: "string", transport: "string",
+  tls: "bool", tlsCertPath: "string", tlsKeyPath: "string", tlsCaPath: "string",
+  tlsServerName: "string", tlsDisableHostVerification: "bool",
+  header: "header"
+}
+
+var ADD_USAGE = "usage: add <url|host:port|profile:NAME> [label] [option=value ...]"
+
+// Turn one line of `omtemporal add` into a server config.
+//
+// The line arrives already flattened -- the IPC takes a single string, and the
+// user's shell removed the quotes long before that -- so
+// `apiKeyCommand='pass show temporal/prod'` is five words by the time it gets
+// here. Anything following an option that is not itself an option therefore
+// belongs to that option, and only the words before the first option are the
+// label. `add host:7233 my prod box` still means what it always did.
+function parseAddSpec(spec) {
+  var value = String(spec || "").trim()
+  if (value === "") return { ok: false, message: ADD_USAGE, config: null, warnings: [] }
+
+  var parts = value.split(/\s+/)
+  var target = parts[0]
+
+  var options = {}
+  var headers = {}
+  var words = []
+  var warnings = []
+  var current = ""
+  var lastHeader = ""
+
+  for (var i = 1; i < parts.length; i++) {
+    var cut = parts[i].indexOf("=")
+    var name = cut > 0 ? parts[i].substring(0, cut) : ""
+
+    if (cut > 0 && ADD_OPTIONS[name]) {
+      current = name
+      var raw = parts[i].substring(cut + 1)
+      if (ADD_OPTIONS[name] === "header") {
+        // "Name: value" is how a proxy's own setup page writes it; "Name=value"
+        // is how someone who has just typed five other options writes it.
+        var split = raw.indexOf(":") === -1 ? raw.indexOf("=") : raw.indexOf(":")
+        lastHeader = split > 0 ? raw.substring(0, split).trim() : ""
+        if (lastHeader !== "") headers[lastHeader] = raw.substring(split + 1).trim()
+      } else if (ADD_OPTIONS[name] === "bool") {
+        options[name] = raw === "true" || raw === "1"
+      } else {
+        options[name] = raw
+      }
+      continue
+    }
+
+    if (current === "") {
+      words.push(parts[i])
+    } else if (ADD_OPTIONS[current] === "header") {
+      if (lastHeader !== "") headers[lastHeader] = (headers[lastHeader] + " " + parts[i]).trim()
+    } else if (ADD_OPTIONS[current] !== "bool") {
+      options[current] = String(options[current] || "") + " " + parts[i]
+    }
+  }
+
+  var label = words.join(" ")
+  var config = null
+  if (target.indexOf("profile:") === 0) {
+    config = { profile: target.substring(8), transport: "cli" }
+    config.label = label || config.profile
+  } else if (target.match(/^https?:\/\//)) {
+    config = { url: target, transport: "http" }
+    config.label = label || hostOf(target)
+  } else {
+    config = { address: target, transport: "cli" }
+    config.label = label || target
+  }
+
+  for (var key in options) config[key] = options[key]
+  if (headerCount(headers) > 0) config.headers = headers
+
+  if (options.apiKey) {
+    // Too late to keep it out of the shell history, but not too late to say so
+    // before it also goes into shell.json in the clear.
+    warnings.push("apiKey is now in your shell history and in shell.json; apiKeyCommand avoids both")
+  }
+
+  return { ok: true, message: "", config: config, warnings: warnings }
+}
+
+// What to print once the server has been added -- or refused. Everything the
+// user needs to know that they did not just type: which transport it ended up
+// on, what credentials it carries, and anything already known to be wrong.
+function addVerdict(normalized, warnings) {
+  var lines = ["added " + normalized.label + " (" + normalized.transport + ", "
+    + authSummary(normalized).text + ")"]
+  if (normalized.transportNote) lines.push(normalized.transportNote)
+  var issues = authConfigIssues(normalized)
+  for (var i = 0; i < issues.length; i++) lines.push(issues[i].level + ": " + issues[i].text)
+  var extra = isList(warnings) ? warnings : []
+  for (var j = 0; j < extra.length; j++) lines.push("warn: " + extra[j])
+  return lines.join("\n")
+}
+
+// --- error classification ---------------------------------------------------------
+//
+// "Unreachable" and "your token expired" are different problems with different
+// fixes, and until now the panel called both of them the same thing. Both
+// transports funnel their failures through here.
+
+// gRPC's UNAUTHENTICATED (16) and PERMISSION_DENIED (7) reach us three ways:
+// as an HTTP status from the API, as a `code` in the JSON error body, and as
+// English in the CLI's stderr. All three have to land on the same kind.
+//
+// Self-hosted Temporal makes this harder than it looks. Its authorization
+// interceptor answers *every* claim-mapping failure with PermissionDenied and
+// the deliberately uninformative "Request unauthorized." -- a malformed token,
+// an expired one and a missing permission are one status and one string. So
+// that exact phrasing is read as an authentication failure (worth refreshing
+// the token for) and a code 7 carrying anything else as an authorization one.
+var AUTH_PATTERNS = [
+  /unauthenticated/i,
+  /invalid[ _-]?(api[ _-]?key|token|credential)/i,
+  /token (is )?(expired|invalid|rejected)/i,
+  /request unauthorized/i,
+  /authentication (failed|error)/i,
+  /\bcode = Unauthenticated\b/
+]
+
+var DENIED_PATTERNS = [
+  /permission[ _]?denied/i,
+  /not authorized/i,
+  /unauthorized to/i,
+  /forbidden/i,
+  /\bcode = PermissionDenied\b/
+]
+
+var NETWORK_PATTERNS = [
+  /connection refused/i,
+  /no such host/i,
+  /name resolution/i,
+  /\bcode = Unavailable\b/,
+  /last connection error/i,
+  /context deadline exceeded/i,
+  /i\/o timeout/i,
+  /transport: /i
+]
+
+var TLS_PATTERNS = [
+  /x509/i,
+  /tls: /i,
+  /certificate (signed by unknown authority|has expired|is not valid)/i,
+  /bad certificate/i,
+  /remote error: tls/i,
+  // What the CLI says when tlsCertPath points at nothing. It is a config
+  // mistake rather than a handshake failure, but it belongs in the same
+  // paragraph of the same page, so it gets the same kind.
+  /invalid tls config/i,
+  /client cert\/key path/i
+]
+
+function matchesAny(patterns, text) {
+  for (var i = 0; i < patterns.length; i++) if (patterns[i].test(text)) return true
+  return false
+}
+
+// `context` is optional and only shapes the wording: { namespace, operation }.
+//
+// Returns:
+//   kind      auth | denied | tls | network | timeout | notFound | server | unknown
+//   message   what the panel shows -- short, and says what to do where it can
+//   detail    the original text, for doctor and the journal
+//   reauth    worth resolving apiKeyCommand again and retrying once
+function classifyError(body, status, context) {
+  var ctx = context || {}
+  var raw = String(body === undefined || body === null ? "" : body)
+  var code = 0
+  var text = raw
+
+  // The API reports errors as {code, message, details}; a proxy in front of it
+  // reports an HTML page, and the CLI reports a line of Go.
+  try {
+    var parsed = JSON.parse(raw)
+    if (parsed && parsed.message) {
+      text = String(parsed.message)
+      code = Number(parsed.code) || 0
+    }
+  } catch (error) {
+    // not JSON -- the raw text is the best evidence there is
+  }
+
+  var httpStatus = Number(status) || 0
+
+  if (httpStatus === 401 || code === 16 || matchesAny(AUTH_PATTERNS, text)) {
+    return classified("auth", authRejectedText(ctx), text, true)
+  }
+  if (httpStatus === 403 || code === 7 || matchesAny(DENIED_PATTERNS, text)) {
+    return classified("denied", deniedText(ctx, text), text, false)
+  }
+  if (matchesAny(TLS_PATTERNS, text)) {
+    return classified("tls", "tls handshake failed: " + firstLine(text), text, false)
+  }
+  if (httpStatus === 404 || code === 5) {
+    return classified("notFound", ctx.namespace ? "no namespace " + ctx.namespace : "not found", text, false)
+  }
+  if (/timed out|no response in/i.test(text)) {
+    return classified("timeout", firstLine(text) || "timed out", text, false)
+  }
+  if (httpStatus === 0 && text === "") {
+    return classified("network", "unreachable", text, false)
+  }
+  if (matchesAny(NETWORK_PATTERNS, text)) {
+    return classified("network", firstLine(text), text, false)
+  }
+  if (httpStatus >= 500) {
+    return classified("server", "server error (HTTP " + httpStatus + ")", text, false)
+  }
+  if (text !== "") return classified("unknown", firstLine(text), text, false)
+  if (httpStatus !== 0) return classified("unknown", "HTTP " + httpStatus, text, false)
+  return classified("network", "unreachable", text, false)
+}
+
+function classified(kind, message, detail, reauth) {
+  return { kind: kind, message: message, detail: detail, reauth: reauth === true, auth: isAuthKind(kind) }
+}
+
+function isAuthKind(kind) {
+  return kind === "auth" || kind === "denied"
+}
+
+function firstLine(text) {
+  var lines = String(text || "").split("\n")
+  var line = ""
+  for (var i = 0; i < lines.length && line === ""; i++) line = lines[i].trim()
+  if (line === "") return ""
+  return line.length <= 160 ? line : line.substring(0, 157) + "..."
+}
+
+// 401 means the credential itself was not accepted. Saying which credential is
+// the whole value of the message: "unauthorized" sends people to the server
+// logs, "token rejected" sends them to their token.
+function authRejectedText(ctx) {
+  if (ctx.refreshed) return "token still rejected after refreshing it"
+  if (ctx.namespace) return "token rejected for " + ctx.namespace + " — expired, or not permitted here"
+  return "token rejected — expired, or not a key for this server"
+}
+
+// 403 means the credential is real and does not cover this. Naming the
+// namespace turns a dead end into a request someone can make of their admin.
+function deniedText(ctx, text) {
+  // Not an authorization failure at all: frontend.httpAllowedHosts rejects the
+  // Host header with the same code 7 a refused namespace uses, and hunting for
+  // a missing permission that was never the problem costs an afternoon.
+  if (/host not allowed/i.test(String(text || ""))) {
+    return "the server refused this Host header — see frontend.httpAllowedHosts"
+  }
+  if (ctx.operation === "listNamespaces") return "no permission to list namespaces"
+  if (ctx.namespace) return "no permission for namespace " + ctx.namespace
+  return "no permission for this operation"
+}
+
+// --- namespace-level authorization -------------------------------------------------
+//
+// A credential scoped to two namespaces can read both of them and still be
+// refused ListNamespaces, because listing is a cluster-level call. Failing the
+// whole server for that hides data the token is perfectly entitled to.
+
+function namespaceFallback(server, previousNames, classification) {
+  var kind = (classification && classification.kind) || "unknown"
+  var why = (classification && classification.message) || "namespace discovery failed"
+
+  var configured = (server && isList(server.namespaces)) ? server.namespaces : []
+  if (configured.length > 0) {
+    return {
+      names: configured.slice(),
+      note: "cannot list namespaces (" + why + "); using the " + configured.length
+        + " configured for this server",
+      fail: false,
+      message: ""
+    }
+  }
+
+  var previous = isList(previousNames) ? previousNames : []
+  if (previous.length > 0) {
+    return {
+      names: previous.slice(),
+      note: "cannot list namespaces (" + why + "); still showing the "
+        + previous.length + " from the last poll that could",
+      fail: false,
+      message: ""
+    }
+  }
+
+  // Nothing to fall back to. For an authorization failure that is a config
+  // problem with a known fix, so say the fix rather than the symptom.
+  if (isAuthKind(kind)) {
+    return {
+      names: [],
+      note: "",
+      fail: true,
+      message: why + ". Add \"namespaces\": [\"…\"] to this server so it "
+        + "reads them directly instead of listing them."
+    }
+  }
+  return { names: [], note: "", fail: true, message: why }
+}
+
+// --- redaction -------------------------------------------------------------------
+//
+// Error text goes to the panel, to `omtemporal doctor` and to the journal. A
+// token that reaches any of those has leaked, and the ways it can get in there
+// are not all ours -- a Go client will happily print the header it sent.
+
+var REDACTED = "••••"
+
+function redact(text, secrets) {
+  var out = String(text === undefined || text === null ? "" : text)
+  var list = isList(secrets) ? secrets : [secrets]
+  for (var i = 0; i < list.length; i++) {
+    var secret = String(list[i] || "")
+    // Short values are not credentials, and blanking them would mangle the
+    // message for no gain.
+    if (secret.length < 8) continue
+    while (out.indexOf(secret) !== -1) out = out.replace(secret, REDACTED)
+  }
+  // Anything that looks like a credential regardless of whether we know it.
+  out = out.replace(/(Bearer\s+)[A-Za-z0-9._~+/=-]{8,}/gi, "$1" + REDACTED)
+  out = out.replace(/(--api-key[= ])[^\s"']{8,}/gi, "$1" + REDACTED)
+  out = out.replace(/(Authorization:\s*\S+\s+)[A-Za-z0-9._~+/=-]{8,}/gi, "$1" + REDACTED)
+  return out
+}
+
+// Every secret a server could put into a message, for redact().
+function serverSecrets(server, resolvedKey) {
+  var out = []
+  if (!server) return out
+  if (server.apiKey) out.push(String(server.apiKey))
+  if (resolvedKey) out.push(String(resolvedKey))
+  var headers = server.headers || {}
+  for (var name in headers) if (String(headers[name]).length >= 8) out.push(String(headers[name]))
+  return out
+}
+
+// --- doctor ---------------------------------------------------------------------
+//
+// `omtemporal doctor` is what people run when the panel is empty, and auth is
+// now the most likely reason it is. One line per server, plus every issue the
+// config already tells us about, plus how the last poll actually went.
+
+// Tab-separated records, one type per line, and never an empty field: `read`
+// with IFS set to tab collapses runs of tabs, so a line that begins with two of
+// them arrives one field short and every column after it is wrong.
+//
+//   server   <label> <transport> <verdict> <detail>
+//   issue    <level> <text>
+//   file     <field> <path>          -- doctor stats it; only doctor can
+//   command  <field> <command>       -- doctor runs it; only doctor can
+function authReport(servers, serverStates) {
+  var list = isList(servers) ? servers : []
+  if (list.length === 0) return "no servers configured"
+
+  var states = isList(serverStates) ? serverStates : []
+  var lines = []
+  for (var i = 0; i < list.length; i++) {
+    var server = list[i]
+    var summary = authSummary(server)
+    var state = i < states.length ? states[i] : null
+
+    var verdict = "ok"
+    var detail = summary.text
+    if (state && state.ok === false) {
+      verdict = isAuthKind(String(state.errorKind || "")) ? "auth" : "down"
+      detail = summary.text + " — " + String(state.error || "")
+    } else if (state && state.notice) {
+      verdict = "partial"
+      detail = summary.text + " — " + String(state.notice)
+    } else if (state && state.pending) {
+      verdict = "pending"
+    }
+
+    lines.push(["server", server.label, server.transport, verdict, detail].join("\t"))
+
+    var issues = authConfigIssues(server)
+    for (var j = 0; j < issues.length; j++) {
+      lines.push(["issue", issues[j].level, issues[j].text].join("\t"))
+    }
+    // Named, not checked. Whether the file is readable and whether the command
+    // works are questions only a process with a terminal can answer, and doctor
+    // is that process.
+    var tls = server.tls || normalizeTls({})
+    if (tls.certPath) lines.push(["file", "tlsCertPath", tls.certPath].join("\t"))
+    if (tls.keyPath) lines.push(["file", "tlsKeyPath", tls.keyPath].join("\t"))
+    if (tls.caPath) lines.push(["file", "tlsCaPath", tls.caPath].join("\t"))
+    if (server.apiKeyCommand) lines.push(["command", "apiKeyCommand", server.apiKeyCommand].join("\t"))
+  }
+  return lines.join("\n")
 }
 
 // --- response parsing ---------------------------------------------------------
@@ -636,17 +1348,12 @@ function taskQueuesFromExecutions(workflows) {
   return out
 }
 
-// The API reports errors as {code, message, details}; anything else (a proxy
-// error page, a connection refusal) falls back to the HTTP status.
-function errorMessage(body, status) {
-  try {
-    var parsed = JSON.parse(body)
-    if (parsed && parsed.message) return String(parsed.message)
-  } catch (error) {
-    // not JSON -- fall through
-  }
-  if (status === 0) return "unreachable"
-  return "HTTP " + status
+// The one-line form of classifyError, kept because most callers only want the
+// string. Anything that has to branch on *why* -- retrying after a token
+// refresh, falling back to the configured namespaces -- calls classifyError
+// itself and reads the kind.
+function errorMessage(body, status, context) {
+  return classifyError(body, status, context).message
 }
 
 // --- formatting ----------------------------------------------------------------
@@ -1039,7 +1746,7 @@ function fleetEntries(serverStates, nowMs) {
       // "…" only when there is genuinely nothing to show yet; a refresh over
       // data we already have should not blank the row.
       trailing: !reachable
-        ? "unreachable"
+        ? failureWord(server.errorKind)
         : (server.pending && totals.namespaces === 0 ? "…" : totals.running + " running"),
       trailingSub: !reachable
         ? String(server.error || "")
@@ -1061,6 +1768,20 @@ function fleetEntries(serverStates, nowMs) {
   }))
 
   return entries
+}
+
+// The word in the corner of a server row that is not working. "unreachable" on
+// a rejected token is a lie that costs an hour of tcpdump, so the kind decides
+// the word and the error itself goes underneath.
+function failureWord(kind) {
+  switch (String(kind || "")) {
+  case "auth": return "token rejected"
+  case "denied": return "no permission"
+  case "config": return "misconfigured"
+  case "tls": return "tls failed"
+  case "timeout": return "no answer"
+  }
+  return "unreachable"
 }
 
 // --- one server -----------------------------------------------------------------------------
@@ -1094,6 +1815,11 @@ function serverEntries(server, nowMs) {
     entries.push(noteEntry("", String(server.error || "unreachable"), "bad"))
     return entries
   }
+
+  // Said out loud rather than left to be inferred from a short list: a server
+  // that fell back to its configured namespaces, or that had to move onto the
+  // cli transport, is showing something other than what was asked for.
+  if (server.notice) entries.push(noteEntry("", String(server.notice), "dim"))
 
   var namespaces = isList(server.namespaces) ? server.namespaces : []
   if (namespaces.length === 0) {

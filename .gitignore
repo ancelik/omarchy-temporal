@@ -1,2 +1,6 @@
 # Subagent worktrees live here; never part of the plugin.
 .claude/
+
+# collect.py runs from the installed plugin directory.
+__pycache__/
+*.pyc

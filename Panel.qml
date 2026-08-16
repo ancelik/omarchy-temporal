@@ -375,11 +375,22 @@ Panel {
           state.label,
           state.transport,
           state.host,
-          state.pending ? "pending" : (state.ok ? "ok" : "down: " + state.error),
+          state.pending
+            ? "pending"
+            : (state.ok ? "ok" : (state.errorKind || "down") + ": " + state.error),
           state.namespaces.length + " namespaces"
+            + (state.notice ? " (" + state.notice + ")" : "")
         ].join("  ·  "))
       }
       return lines.join("\n")
+    }
+
+    // Why a server might be refusing to answer, in tab-separated fields for
+    // `omtemporal doctor` to lay out. Config and last-poll evidence together:
+    // "an api key from a command, and the server rejected it" is the sentence
+    // that ends the investigation, and neither half says it alone.
+    function auth(): string {
+      return Model.authReport(service.servers, service.serverStates)
     }
   }
 

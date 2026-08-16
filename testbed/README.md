@@ -24,6 +24,49 @@ Point the plugin at both by putting this on its entry in
 ]
 ```
 
+## Testing authentication
+
+`temporal server start-dev` **cannot enforce authentication**. There is no
+`--authorizer` and no `--config` — both are rejected outright — and it ignores
+the `TEMPORAL_AUTH_*` variables the full server distribution reads: ask it to
+print its own config and `authorizer` comes back empty. An unauthenticated
+request and one carrying `Authorization: Bearer totally-fake` both return `200`.
+
+So `authproxy.py` sits in front of `temporal-a` instead, which is also the
+topology the feature is for: self-hosted Temporal behind Cloudflare Access, an
+ingress or an oauth2-proxy. It is behind a compose profile, so the default
+`docker compose up` is unchanged.
+
+```bash
+docker compose --profile auth up -d authproxy
+node ../testbed/parity-test.mjs        # the auth section runs when it is up
+```
+
+| | Port | Requires |
+|---|---|---|
+| `authproxy` → `temporal-a` | 7253 | `Authorization: Bearer s3cret-token-value`, plus `CF-Access-Client-Id: cf-client-id` and `CF-Access-Client-Secret: cf-client-secret` |
+
+It refuses `ListNamespaces` with a `403` even for a valid token, which is how a
+namespace-scoped credential really behaves and what the plugin's namespace
+fallback exists for. To point the plugin at it:
+
+```json
+{
+  "label": "proxied",
+  "url": "http://localhost:7253",
+  "uiUrl": "http://localhost:8233",
+  "namespaces": ["orders", "payments"],
+  "apiKeyCommand": "printf s3cret-token-value",
+  "headers": {
+    "CF-Access-Client-Id": "cf-client-id",
+    "CF-Access-Client-Secret": "cf-client-secret"
+  }
+}
+```
+
+Change `TOKEN` on the service to watch the panel report a rejected token, and
+`DENY_LIST=0` to turn the namespace refusal off.
+
 ## What runs in there
 
 `worker.py` hosts one Worker per namespace on a single asyncio loop (a Worker
