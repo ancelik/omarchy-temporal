@@ -17,7 +17,8 @@ Usage: omtemporal <command> [args]
 
   setup                  Interactive: pick from what is on this machine
   list                   Show configured servers
-  add <target> [label]   Add a server
+  add <target> [label] [option=value ...]
+                         Add a server
   remove <label>         Remove a server
   status                 One-line summary of the whole fleet
   doctor                 Check every server, and why one might be empty
@@ -28,9 +29,21 @@ Targets:
   host:7233              gRPC       (via the temporal CLI)
   profile:NAME           a profile from your temporal.toml
 
+Options for add (see AUTH.md):
+  apiKeyCommand=CMD      Shell command whose stdout is the token
+  apiKeyTtlSec=N         How long to keep it before re-running (default 900)
+  header='Name: value'   A header for every request; repeatable
+  namespaces=a,b         Pin the namespaces, for a scoped credential
+  tlsCertPath=PATH       Client certificate — forces the cli transport
+  tlsKeyPath=PATH        and its key
+  tlsCaPath=PATH         CA to verify the server with
+  uiUrl=URL              Web UI base, for links
+
 Examples:
   omtemporal add http://localhost:7243 local
   omtemporal add profile:prod
+  omtemporal add https://temporal.corp:7243 prod apiKeyCommand='pass temporal/prod'
+  omtemporal add temporal.corp:7233 prod tlsCertPath=~/certs/c.pem tlsKeyPath=~/certs/k.pem
   omtemporal open namespace 0 orders
 USAGE
 }
@@ -112,8 +125,12 @@ cmd_setup() {
 
   echo "Looking for Temporal servers…"
   local found
-  found=$(python3 "$PLUGIN_DIR/collect.py" \
-    '{"mode":"discover","addresses":["localhost:7233","localhost:7234","localhost:7235"],"timeoutSec":6}')
+  # On stdin, like every other call into the collector. Discovery carries no
+  # credentials, but there is no reason to keep a second calling convention
+  # alive for the one spec that happens not to.
+  found=$(printf '%s' \
+    '{"mode":"discover","addresses":["localhost:7233","localhost:7234","localhost:7235"],"timeoutSec":6}' \
+    | python3 "$PLUGIN_DIR/collect.py" -)
 
   local -a targets=() labels=()
   while IFS=$'\t' read -r target label; do
@@ -161,6 +178,86 @@ cmd_setup() {
   done
 }
 
+# A certificate the widget cannot read fails its handshake, which looks exactly
+# like a certificate the server rejected. Worth ten lines to tell the two apart.
+doctor_file() {
+  local field="$1" path="$2" mode=""
+  if [[ ! -e $path ]]; then
+    printf '  FAIL      %s: no such file — %s\n' "$field" "$path"
+    return
+  fi
+  if [[ ! -r $path ]]; then
+    printf '  FAIL      %s: not readable by you — %s\n' "$field" "$path"
+    return
+  fi
+  mode=$(stat -c '%a' "$path" 2>/dev/null || echo "")
+  if [[ $field == *Key* && ${mode: -1} == [4-7] ]]; then
+    printf '  warn      %s: %s is world readable (mode %s)\n' "$field" "$path" "$mode"
+  else
+    printf '  ok        %s: %s\n' "$field" "$path"
+  fi
+}
+
+# Run the key command and report whether it worked -- never what it printed.
+# "exited zero and produced something" is the entire diagnosis; the something is
+# the token. This may prompt for a passphrase, which is the point: if it prompts
+# here it also prompts for the widget, and that is why the panel is empty.
+doctor_command() {
+  local field="$1" command="$2" out="" code=0
+  out=$(timeout 20 bash -lc "$command" 2>/dev/null) || code=$?
+  if (( code != 0 )); then
+    printf '  FAIL      %s exited %d — %s\n' "$field" "$code" "$command"
+    return
+  fi
+  if [[ -z ${out//[[:space:]]/} ]]; then
+    printf '  FAIL      %s succeeded but printed nothing — %s\n' "$field" "$command"
+    return
+  fi
+  printf '  ok        %s produced a %d-character token\n' "$field" "${#out}"
+}
+
+# Auth is now the leading cause of an empty panel, so it gets its own section:
+# what each server carries, anything already known to be wrong with the way it
+# is configured, and whether the files and commands it points at actually work.
+doctor_credentials() {
+  echo "credentials"
+  local report
+  if ! report=$(ipc auth 2>/dev/null) || [[ -z $report ]]; then
+    echo "  --        this widget build does not report credentials"
+    return
+  fi
+  if [[ $report == "no servers configured" ]]; then
+    echo "  --        no servers configured"
+    return
+  fi
+
+  # Every record leads with its type. Reading tab-separated fields with an
+  # empty one first does not work: tab is IFS whitespace, so `read` collapses
+  # a run of them and every column after arrives shifted.
+  local kind f2 f3 f4 f5
+  while IFS=$'\t' read -r kind f2 f3 f4 f5; do
+    case "$kind" in
+    server)
+      case "$f4" in
+      ok) printf '  ok        %-16s %s\n' "$f2" "$f5" ;;
+      pending) printf '  ...       %-16s %s\n' "$f2" "$f5" ;;
+      partial) printf '  warn      %-16s %s\n' "$f2" "$f5" ;;
+      *) printf '  FAIL      %-16s %s\n' "$f2" "$f5" ;;
+      esac
+      ;;
+    issue)
+      if [[ $f2 == error ]]; then
+        printf '  FAIL      %s\n' "$f3"
+      else
+        printf '  warn      %s\n' "$f3"
+      fi
+      ;;
+    file) doctor_file "$f2" "$f3" ;;
+    command) doctor_command "$f2" "$f3" ;;
+    esac
+  done <<<"$report"
+}
+
 # The answer to "why is my widget empty".
 cmd_doctor() {
   command -v omarchy-shell >/dev/null 2>&1 || fail "omarchy is not installed"
@@ -196,32 +293,45 @@ cmd_doctor() {
     echo "  warn      none configured — run: omtemporal setup"
     return 0
   fi
+  local state
   printf '%s\n' "$report" | while IFS= read -r line; do
-    if [[ $line == *"down:"* ]]; then
-      echo "  FAIL      $line"
-    elif [[ $line == *"pending"* ]]; then
-      # A CLI-transport server spends a moment per poll shelling out; that is
-      # not a fault, and reporting it as one would send people hunting.
-      echo "  ...       $line (mid-poll)"
-    else
-      echo "  ok        $line"
-    fi
+    # The fourth column is the verdict. Matching on the whole line used to mean
+    # anything that was not literally "down:" read as healthy, so a server that
+    # answered "auth: token rejected" was reported as ok.
+    state=$(awk -F '  ·  ' '{ print $4 }' <<<"$line")
+    case "$state" in
+    ok) echo "  ok        $line" ;;
+    # A CLI-transport server spends a moment per poll shelling out; that is not
+    # a fault, and reporting it as one would send people hunting.
+    pending) echo "  ...       $line (mid-poll)" ;;
+    *) echo "  FAIL      $line" ;;
+    esac
   done
 
   # The single most common cause of an empty panel: the HTTP API is off, so
-  # check it separately from whether the plugin happens to be using it.
+  # check it separately from whether the plugin happens to be using it. The
+  # second most common one is that it is on and refusing us, which is a
+  # different answer and used to be reported as the first.
   echo "http api"
-  local any=0
+  local any=0 code=""
   while IFS= read -r url; do
     [[ -n $url ]] || continue
     any=1
-    if curl -sf -m 3 "$url/api/v1/cluster-info" >/dev/null 2>&1; then
-      echo "  ok        $url"
-    else
-      echo "  FAIL      $url did not answer — is the server started with --http-port?"
-    fi
-  done < <(printf '%s\n' "$report" | awk -F '·' '/http/ { gsub(/ /, "", $3); if ($3 != "") print "http://" $3 }')
+    code=$(curl -s -o /dev/null -m 3 -w '%{http_code}' "$url/api/v1/cluster-info" 2>/dev/null || echo "000")
+    case "$code" in
+    2*) echo "  ok        $url" ;;
+    401 | 403)
+      echo "  warn      $url answered $code — it is up and wants credentials"
+      echo "            set apiKeyCommand or headers for it; see AUTH.md"
+      ;;
+    000) echo "  FAIL      $url did not answer — is the server started with --http-port?" ;;
+    *) echo "  FAIL      $url answered HTTP $code" ;;
+    esac
+  done < <(printf '%s\n' "$report" \
+    | awk -F '  ·  ' '$2 == "http" && $3 != "" { print "http://" $3 }' | sort -u)
   (( any == 1 )) || echo "  --        no servers using the http transport"
+
+  doctor_credentials
 }
 
 command="${1:-}"

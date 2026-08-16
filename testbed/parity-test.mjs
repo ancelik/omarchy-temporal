@@ -503,15 +503,28 @@ const report = Model.authReport(
   [{ ok: false, error: "token rejected", errorKind: "auth" }]
 ).split("\n")
 check("a rejected server is reported as an auth problem, not a down one",
-  report[0].split("\t")[2], "auth")
-check("and the command to check is named",
-  report.some(line => line.includes("apiKeyCommand")), true)
+  report[0].split("\t")[3], "auth")
+check("and the command to check is named on its own record",
+  report.some(line => line.split("\t")[0] === "command" && line.includes("apiKeyCommand")), true)
 check("nothing configured is its own answer", Model.authReport([], []), "no servers configured")
 check("a healthy server reads ok",
-  Model.authReport([bare], [{ ok: true, pending: false }]).split("\t")[2], "ok")
+  Model.authReport([bare], [{ ok: true, pending: false }]).split("\t")[3], "ok")
 check("a fallback shows as partial rather than fine",
   Model.authReport([scoped], [{ ok: true, pending: false, notice: "cannot list namespaces (x)" }])
-    .split("\t")[2], "partial")
+    .split("\t")[3], "partial")
+// Every record starts with its type and has no empty fields, because `read`
+// with IFS=tab silently merges runs of tabs and shifts every column left.
+check("no record has an empty field",
+  Model.authReport(
+    [Model.normalizeServers([{ address: "x:7233", tlsCertPath: "/c.pem", tlsKeyPath: "/k.pem",
+      apiKeyCommand: "pass t" }])[0]], []
+  ).split("\n").every(line => line.split("\t").every(field => field !== "")), true)
+check("and every record names its type",
+  new Set(Model.authReport(
+    [Model.normalizeServers([{ address: "x:7233", tlsCertPath: "/c.pem", tlsKeyPath: "/k.pem",
+      apiKeyCommand: "pass t" }])[0]], []
+  ).split("\n").map(line => line.split("\t")[0])),
+  new Set(["server", "file", "command"]))
 
 // --- the collector keeps credentials off argv ------------------------------------------------
 //

@@ -896,6 +896,14 @@ function serverSecrets(server, resolvedKey) {
 // now the most likely reason it is. One line per server, plus every issue the
 // config already tells us about, plus how the last poll actually went.
 
+// Tab-separated records, one type per line, and never an empty field: `read`
+// with IFS set to tab collapses runs of tabs, so a line that begins with two of
+// them arrives one field short and every column after it is wrong.
+//
+//   server   <label> <transport> <verdict> <detail>
+//   issue    <level> <text>
+//   file     <field> <path>          -- doctor stats it; only doctor can
+//   command  <field> <command>       -- doctor runs it; only doctor can
 function authReport(servers, serverStates) {
   var list = isList(servers) ? servers : []
   if (list.length === 0) return "no servers configured"
@@ -919,19 +927,20 @@ function authReport(servers, serverStates) {
       verdict = "pending"
     }
 
-    lines.push([server.label, server.transport, verdict, detail].join("\t"))
+    lines.push(["server", server.label, server.transport, verdict, detail].join("\t"))
 
     var issues = authConfigIssues(server)
     for (var j = 0; j < issues.length; j++) {
-      lines.push(["", "", issues[j].level, issues[j].text].join("\t"))
+      lines.push(["issue", issues[j].level, issues[j].text].join("\t"))
     }
-    // Paths are checked by the shell script, which can actually stat them; this
-    // just tells it which ones matter for this server.
+    // Named, not checked. Whether the file is readable and whether the command
+    // works are questions only a process with a terminal can answer, and doctor
+    // is that process.
     var tls = server.tls || normalizeTls({})
-    if (tls.certPath) lines.push(["", "", "file", "tlsCertPath\t" + tls.certPath].join("\t"))
-    if (tls.keyPath) lines.push(["", "", "file", "tlsKeyPath\t" + tls.keyPath].join("\t"))
-    if (tls.caPath) lines.push(["", "", "file", "tlsCaPath\t" + tls.caPath].join("\t"))
-    if (server.apiKeyCommand) lines.push(["", "", "command", "apiKeyCommand\t" + server.apiKeyCommand].join("\t"))
+    if (tls.certPath) lines.push(["file", "tlsCertPath", tls.certPath].join("\t"))
+    if (tls.keyPath) lines.push(["file", "tlsKeyPath", tls.keyPath].join("\t"))
+    if (tls.caPath) lines.push(["file", "tlsCaPath", tls.caPath].join("\t"))
+    if (server.apiKeyCommand) lines.push(["command", "apiKeyCommand", server.apiKeyCommand].join("\t"))
   }
   return lines.join("\n")
 }
