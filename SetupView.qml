@@ -22,6 +22,13 @@ Item {
   property string cliPath: "temporal"
   property var servers: []
 
+  // What an edit looks like before the write has come back around. Persisting
+  // goes out to the shell, into shell.json, and only reaches `servers` after a
+  // config reload -- so without this every edit shows its OLD value for as long
+  // as that takes, which reads as "nothing happened" and gets it retyped.
+  property var pendingServers: null
+  readonly property var shownServers: pendingServers !== null ? pendingServers : servers
+
   // Ports a dev server is conventionally reachable on. `temporal server
   // start-dev --http-port 7243` is the documented incantation, and the test bed
   // and most local setups follow it.
@@ -49,8 +56,8 @@ Item {
   property string editValue: ""
   property bool editSecret: false
 
-  readonly property var editServer: editIndex >= 0 && editIndex < servers.length
-    ? servers[editIndex] : null
+  readonly property var editServer: editIndex >= 0 && editIndex < shownServers.length
+    ? shownServers[editIndex] : null
 
   readonly property var entries: buildEntries()
 
@@ -189,22 +196,44 @@ Item {
   // the shell owns shell.json and writes it back correctly, preserving this
   // widget's position in the bar.
   function persist(list) {
+    // Shown immediately; dropped again once the reload brings the real thing
+    // back, or reverted if the shell refuses the write.
+    pendingServers = list
+
     // Wrapped in an object on purpose. `setBarWidget` stores a value that is a
     // bare JSON array as null, but preserves the identical array when it is a
     // field of an object. Model.normalizeServers reads both forms, so a
     // hand-written plain array keeps working.
-    var json = JSON.stringify({ list: Model.serversToConfig(list) })
-    Quickshell.execDetached([
-      "bash", "-lc",
-      "exec omarchy-shell shell setBarWidget \"$0\" servers \"$1\" '{}'",
-      root.pluginId, json
-    ])
+    writer.payload = JSON.stringify({ list: Model.serversToConfig(list) })
+    writer.running = true
     root.changed()
   }
 
+  // A Process rather than execDetached, because setBarWidget answers "ok" or an
+  // error string and an edit that silently failed to save is worse than one
+  // that refused out loud.
+  Process {
+    id: writer
+    property string payload: ""
+
+    command: ["omarchy-shell", "shell", "setBarWidget", root.pluginId, "servers", payload, "{}"]
+
+    stdout: StdioCollector { id: writerOut; waitForEnd: true }
+
+    onExited: function (exitCode) {
+      var answer = String(writerOut.text || "").trim()
+      if (exitCode === 0 && answer === "ok") return
+      root.pendingServers = null
+      root.status = "could not save: " + (answer !== "" ? answer : "exit " + exitCode)
+    }
+  }
+
+  // The reload landed, so the overlay has done its job.
+  onServersChanged: pendingServers = null
+
   function alreadyConfigured(match) {
-    for (var i = 0; i < servers.length; i++) {
-      var server = servers[i]
+    for (var i = 0; i < shownServers.length; i++) {
+      var server = shownServers[i]
       if (match.url && server.url === match.url) return true
       if (match.address && server.address === match.address) return true
       if (match.profile && server.profile === match.profile) return true
@@ -214,7 +243,7 @@ Item {
 
   function addServer(config, thenEdit) {
     var list = []
-    for (var i = 0; i < servers.length; i++) list.push(servers[i])
+    for (var i = 0; i < shownServers.length; i++) list.push(shownServers[i])
     list.push(Model.normalizeServer(config, list.length))
     persist(list)
     status = "Added " + config.label
@@ -226,7 +255,7 @@ Item {
 
   function removeServer(index) {
     var list = []
-    for (var i = 0; i < servers.length; i++) if (i !== index) list.push(servers[i])
+    for (var i = 0; i < shownServers.length; i++) if (i !== index) list.push(shownServers[i])
     persist(list)
     status = "Removed"
   }
@@ -274,8 +303,8 @@ Item {
   function removeByLabel(label) {
     var wanted = String(label || "").trim()
     if (wanted === "") return "usage: remove <label>"
-    for (var i = 0; i < servers.length; i++) {
-      if (servers[i].label === wanted) {
+    for (var i = 0; i < shownServers.length; i++) {
+      if (shownServers[i].label === wanted) {
         removeServer(i)
         return "removed " + wanted
       }
@@ -305,12 +334,12 @@ Item {
     var out = []
 
     // What is configured now
-    if (servers.length === 0) {
+    if (shownServers.length === 0) {
       out.push(Model.noteEntry("CONFIGURED SERVERS",
         "None yet. Pick one below, or add an address by hand."))
     } else {
-      for (var i = 0; i < servers.length; i++) {
-        var server = servers[i]
+      for (var i = 0; i < shownServers.length; i++) {
+        var server = shownServers[i]
         var summary = Model.authSummary(server)
         out.push(Model.entry({
           section: "CONFIGURED SERVERS",
@@ -526,8 +555,8 @@ Item {
 
     var updated = Model.applyServerField(server, editField, value)
     var list = []
-    for (var i = 0; i < servers.length; i++) {
-      list.push(i === editIndex ? Model.normalizeServer(updated, i) : servers[i])
+    for (var i = 0; i < shownServers.length; i++) {
+      list.push(i === editIndex ? Model.normalizeServer(updated, i) : shownServers[i])
     }
     persist(list)
     status = editLabel + " updated"
@@ -539,8 +568,8 @@ Item {
     if (!server) return
     var updated = Model.applyServerField(server, String(payload.key), "")
     var list = []
-    for (var i = 0; i < servers.length; i++) {
-      list.push(i === editIndex ? Model.normalizeServer(updated, i) : servers[i])
+    for (var i = 0; i < shownServers.length; i++) {
+      list.push(i === editIndex ? Model.normalizeServer(updated, i) : shownServers[i])
     }
     persist(list)
     status = String(payload.label) + " changed"

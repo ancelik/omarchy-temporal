@@ -477,7 +477,13 @@ Panel {
         }
         root.moveCursor(dy)
       }
-      onActivateRequested: if (root.cursorActive) root.activateEntry(root.selectedEntry())
+      onActivateRequested: {
+        // Acting on the first selectable row is what someone pressing Enter on
+        // a freshly opened panel means; making them press j first to "arm" the
+        // cursor just looks broken.
+        root.cursorActive = true
+        root.activateEntry(root.selectedEntry())
+      }
       onDeleteRequested: {
         var entry = root.selectedEntry()
         if (root.onboarding && entry && String(entry.action) === "editServer") {
@@ -501,7 +507,7 @@ Panel {
       onTabRequested: function (direction) { root.switchPanel(direction) }
       onTextKey: function (text) {
         if (text === "r" || text === "R") {
-          if (root.onboarding) setup.scan()
+          if (root.onboarding) { if (setup.editIndex < 0) setup.scan() }
           else {
             service.refresh()
             service.fetchDetail(root.route, true)
@@ -510,7 +516,7 @@ Panel {
         else if (text === "o" || text === "O") root.openCurrentInBrowser()
         else if (text === "s" || text === "S") root.go(Model.routeSetup())
         else if (text === "a" || text === "A") {
-          if (root.onboarding) {
+          if (root.onboarding && setup.editIndex < 0) {
             setup.adding = true
             Qt.callLater(function () { addField.forceActiveFocus() })
           }
@@ -661,6 +667,18 @@ Panel {
               ? (setup.editSecret ? "new value — blank leaves it unchanged" : setup.editLabel)
               : "http://host:7243  or  host:7233"
             foreground: root.foreground
+
+            // The key catcher is blocked while this has focus -- that is the
+            // point of it -- so escape has to be handled here or there is no
+            // way out of a field except committing it.
+            Keys.onEscapePressed: function (event) {
+              setup.editField = ""
+              setup.adding = false
+              text = ""
+              keyCatcher.forceActiveFocus()
+              event.accepted = true
+            }
+
             onAccepted: {
               if (setup.editField !== "") setup.commitField(text)
               else setup.addManual(text)
