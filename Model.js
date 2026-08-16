@@ -354,6 +354,7 @@ function serverToConfig(server) {
   if (tls.caPath) out.tlsCaPath = tls.caPath
   if (tls.serverName) out.tlsServerName = tls.serverName
   if (tls.disableHostVerification) out.tlsDisableHostVerification = true
+  if (tls.enabled !== null) out.tls = tls.enabled
   return out
 }
 
@@ -443,7 +444,11 @@ function normalizeTls(value) {
     keyPath: expandHome(value.tlsKeyPath || value.tlsKey || ""),
     caPath: expandHome(value.tlsCaPath || value.tlsCa || ""),
     serverName: String(value.tlsServerName || "").trim(),
-    disableHostVerification: value.tlsDisableHostVerification === true
+    disableHostVerification: value.tlsDisableHostVerification === true,
+    // `temporal` switches TLS on by itself the moment an api key or any tls
+    // option is present, which is right everywhere except a cleartext proxy on
+    // localhost. null means "let the CLI decide", which is what it should do.
+    enabled: triState(value.tls)
   }
   // A CA on its own is server verification, not client identity. Only a
   // cert+key pair is mTLS, and only mTLS is the thing XMLHttpRequest cannot do.
@@ -454,6 +459,11 @@ function normalizeTls(value) {
 
 // ~/certs/... is how people write paths, and neither QML nor `temporal` expands
 // it. Done here so the path in the panel is the path that was actually used.
+function triState(value) {
+  if (value === undefined || value === null || value === "") return null
+  return value === true || value === "true"
+}
+
 function expandHome(raw) {
   var path = String(raw || "").trim()
   if (path === "~") return homeDir()
@@ -557,6 +567,26 @@ function authConfigIssues(server) {
     issues.push(issue("warn", "tlsDisableHostVerification is on; the server's identity is not checked"))
   }
 
+  if (server.transport === "http" && isCloudEndpoint(server.url)) {
+    issues.push(issue("error",
+      "Temporal Cloud does not publish an HTTP API. Use the cli transport with "
+        + "\"address\": \"<namespace>.<account>.tmprl.cloud:7233\"."))
+  }
+
+  if (server.transport === "cli" && isCloudEndpoint(server.address)
+      && server.namespaces.length > 0) {
+    for (var n = 0; n < server.namespaces.length; n++) {
+      // On Cloud the namespace *is* name.accountid everywhere -- CLI, SDK and
+      // API. A bare name earns a NamespaceNotFound that reads like the
+      // namespace was deleted.
+      if (server.namespaces[n].indexOf(".") === -1) {
+        issues.push(issue("warn",
+          "Temporal Cloud namespaces are named <namespace>.<account>; \""
+            + server.namespaces[n] + "\" has no account suffix"))
+      }
+    }
+  }
+
   if (tls.any && server.transport === "http" && !tls.mutual) {
     issues.push(issue("warn",
       "tls settings are ignored on the http transport; the shell's http client uses the system trust store"))
@@ -573,6 +603,15 @@ function hasConfigError(server) {
   var issues = authConfigIssues(server)
   for (var i = 0; i < issues.length; i++) if (issues[i].level === "error") return issues[i].text
   return ""
+}
+
+// Temporal Cloud namespace and regional endpoints. Cloud has no documented
+// HTTP API -- probing one gets a 401 from the auth proxy in front of it, which
+// says an authenticating frontend is listening and nothing at all about whether
+// /api/v1 is routed. So the http transport is not offered for these.
+function isCloudEndpoint(target) {
+  var host = hostOf(target).toLowerCase()
+  return /(^|\.)tmprl\.cloud(:|$)/.test(host) || /(^|\.)api\.temporal\.io(:|$)/.test(host)
 }
 
 function isLoopback(url) {
@@ -607,7 +646,8 @@ function authSpec(server, apiKey) {
     tlsKeyPath: tls.keyPath,
     tlsCaPath: tls.caPath,
     tlsServerName: tls.serverName,
-    tlsDisableHostVerification: tls.disableHostVerification === true
+    tlsDisableHostVerification: tls.disableHostVerification === true,
+    tls: tls.enabled
   }
 }
 
@@ -620,6 +660,13 @@ function authSpec(server, apiKey) {
 // gRPC's UNAUTHENTICATED (16) and PERMISSION_DENIED (7) reach us three ways:
 // as an HTTP status from the API, as a `code` in the JSON error body, and as
 // English in the CLI's stderr. All three have to land on the same kind.
+//
+// Self-hosted Temporal makes this harder than it looks. Its authorization
+// interceptor answers *every* claim-mapping failure with PermissionDenied and
+// the deliberately uninformative "Request unauthorized." -- a malformed token,
+// an expired one and a missing permission are one status and one string. So
+// that exact phrasing is read as an authentication failure (worth refreshing
+// the token for) and a code 7 carrying anything else as an authorization one.
 var AUTH_PATTERNS = [
   /unauthenticated/i,
   /invalid[ _-]?(api[ _-]?key|token|credential)/i,
@@ -692,7 +739,7 @@ function classifyError(body, status, context) {
     return classified("auth", authRejectedText(ctx), text, true)
   }
   if (httpStatus === 403 || code === 7 || matchesAny(DENIED_PATTERNS, text)) {
-    return classified("denied", deniedText(ctx), text, false)
+    return classified("denied", deniedText(ctx, text), text, false)
   }
   if (matchesAny(TLS_PATTERNS, text)) {
     return classified("tls", "tls handshake failed: " + firstLine(text), text, false)
@@ -738,12 +785,19 @@ function firstLine(text) {
 // logs, "token rejected" sends them to their token.
 function authRejectedText(ctx) {
   if (ctx.refreshed) return "token still rejected after refreshing it"
+  if (ctx.namespace) return "token rejected for " + ctx.namespace + " — expired, or not permitted here"
   return "token rejected — expired, or not a key for this server"
 }
 
 // 403 means the credential is real and does not cover this. Naming the
 // namespace turns a dead end into a request someone can make of their admin.
-function deniedText(ctx) {
+function deniedText(ctx, text) {
+  // Not an authorization failure at all: frontend.httpAllowedHosts rejects the
+  // Host header with the same code 7 a refused namespace uses, and hunting for
+  // a missing permission that was never the problem costs an afternoon.
+  if (/host not allowed/i.test(String(text || ""))) {
+    return "the server refused this Host header — see frontend.httpAllowedHosts"
+  }
   if (ctx.operation === "listNamespaces") return "no permission to list namespaces"
   if (ctx.namespace) return "no permission for namespace " + ctx.namespace
   return "no permission for this operation"
