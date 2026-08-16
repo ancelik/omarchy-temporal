@@ -21,7 +21,15 @@ CursorSurface {
 
   readonly property string tone: entry ? String(entry.tone || "normal") : "normal"
   readonly property bool selectable: entry ? entry.selectable !== false : false
-  readonly property bool drills: entry ? String(entry.action || "") !== "" : false
+  readonly property bool navigates: entry ? entry.navigates === true : false
+  readonly property bool external: entry ? entry.external === true : false
+  // A note is commentary on its section -- "nothing found here" -- so it lines
+  // up with the section's own text instead of pretending to be a row.
+  readonly property bool note: entry ? entry.note === true : false
+  // Form rows give up the glyph column too, and their hints wrap: eliding
+  // "a command that prints the token" down to "a command that pr…" turns help
+  // into noise.
+  readonly property bool form: entry ? entry.form === true : false
 
   // The tone decides the accent colour for the glyph and the trailing state;
   // titles stay in the foreground so a dim row is still readable.
@@ -52,8 +60,9 @@ CursorSurface {
     spacing: Style.space(9)
 
     // Info rows carry no glyph, but they still reserve the column so their
-    // labels line up with the rows they describe.
+    // labels line up with the rows they describe. Notes give the column up.
     Item {
+      visible: !root.note && !root.form
       Layout.alignment: Qt.AlignVCenter
       implicitWidth: Style.font.icon
       implicitHeight: Style.font.icon
@@ -78,7 +87,8 @@ CursorSurface {
         color: root.selectable ? root.foreground : root.dim
         font.family: root.fontFamily
         font.pixelSize: Style.font.body
-        elide: Text.ElideRight
+        elide: root.note ? Text.ElideNone : Text.ElideRight
+        wrapMode: root.note ? Text.WordWrap : Text.NoWrap
       }
 
       Text {
@@ -90,7 +100,8 @@ CursorSurface {
         color: root.tone === "bad" ? root.urgent : root.dim
         font.family: root.fontFamily
         font.pixelSize: Style.font.caption
-        elide: Text.ElideMiddle
+        elide: root.form ? Text.ElideNone : Text.ElideMiddle
+        wrapMode: root.form ? Text.WordWrap : Text.NoWrap
       }
     }
 
@@ -118,14 +129,24 @@ CursorSurface {
     }
 
     // A chevron marks the rows that go somewhere, so the hierarchy is visible
-    // before you try it.
-    Text {
+    // before you try it; an arrow marks the ones that leave for the browser.
+    //
+    // The column is always reserved, even when empty. Hiding it outright let
+    // rows without a chevron run further right than rows with one, so the
+    // trailing state -- the column you actually read down -- did not line up.
+    Item {
       Layout.alignment: Qt.AlignVCenter
-      visible: root.drills
-      text: "󰅂"
-      color: root.selected ? root.foreground : Qt.darker(root.foreground, 2.2)
-      font.family: root.fontFamily
-      font.pixelSize: Style.font.caption
+      implicitWidth: Style.font.caption
+      implicitHeight: Style.font.caption
+
+      Text {
+        anchors.centerIn: parent
+        visible: root.navigates || root.external
+        text: root.external ? "󰏌" : "󰅂"
+        color: root.selected ? root.foreground : Qt.darker(root.foreground, 2.2)
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.caption
+      }
     }
   }
 }

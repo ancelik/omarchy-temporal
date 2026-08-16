@@ -91,12 +91,34 @@ Panel {
     return []
   }
 
-  readonly property var crumbs: Model.breadcrumb(route, service.serverStates)
+  // A level's entries arrive in stages -- the poll has the workflows, the
+  // detail fetch adds retention and schedules later -- so a cursor parked at 0
+  // before anything was selectable ends up highlighting an info row that Enter
+  // cannot act on. Re-clamp whenever the list changes.
+  onEntriesChanged: {
+    var clamped = Model.clampSelectable(entries, cursorIndex)
+    if (clamped >= 0 && clamped !== cursorIndex) cursorIndex = clamped
+  }
+
+  readonly property var crumbs: {
+    var trail = Model.breadcrumb(route, service.serverStates)
+    if (onboarding && setup.editIndex >= 0 && setup.editServer) {
+      return trail.concat([{
+        kind: "server",
+        glyph: Model.primitiveGlyph("server"),
+        label: setup.editServer.label
+      }])
+    }
+    return trail
+  }
 
   // The line under the breadcrumb answers "what am I looking at" for whichever
   // level is on screen, rather than always reporting the fleet.
   readonly property string contextLine: {
-    if (onboarding) return service.configured ? "Manage servers" : "Let's find a Temporal server"
+    if (onboarding) {
+      if (setup.editIndex >= 0 && setup.editServer) return "credentials and addresses"
+      return service.configured ? "Manage servers" : "Let's find a Temporal server"
+    }
     switch (route.level) {
     case "fleet":
       return Model.summaryText(totals, service.refreshing)
@@ -157,7 +179,7 @@ Panel {
     // discovery sections sit there claiming nothing is out here.
     if (next.level === "setup" && route.level !== "setup") setup.scan()
     route = next
-    cursorActive = false
+    cursorActive = true
     cursorIndex = Math.max(0, Model.firstSelectable(entries))
     if (panelFlick) panelFlick.contentY = 0
     service.activeRoute = next
@@ -289,7 +311,10 @@ Panel {
 
   onOpenedChanged: if (opened) {
     nowMs = Date.now()
-    cursorActive = false
+    // Shown straight away rather than on the first keypress. Nothing about a
+    // panel with no highlight says "this is keyboard driven", and Enter has to
+    // have a visible target.
+    cursorActive = true
     if (panelFlick) panelFlick.contentY = 0
     if (!service.configured) {
       route = Model.routeSetup()
@@ -359,6 +384,11 @@ Panel {
     // is exactly one implementation of adding and removing a server.
     function add(spec: string): string { return setup.addFromCli(spec) }
     function remove(label: string): string { return setup.removeByLabel(label) }
+    function edit(label: string): string {
+      root.open()
+      root.go(Model.routeSetup())
+      return setup.editByLabel(label)
+    }
     function listServers(): string { return setup.describeConfigured() }
     function discover(): string { setup.scan(); return "scanning" }
 

@@ -1710,8 +1710,22 @@ function sameRoute(a, b) {
 //   action               what Enter does; the panel switches on this
 //   payload              arguments for the action
 
+// Actions that move you to another level. A chevron promises "there is more
+// through here", so a row that merely *does* something must not wear one --
+// every actionable row having the same arrow was why adding a server and
+// opening one looked like the same gesture.
+var NAVIGATING_ACTIONS = {
+  openServer: true, openNamespace: true, openWorkflow: true,
+  openTaskQueue: true, openSetup: true, editServer: true
+}
+
 function entry(fields) {
+  var action = fields.action || ""
   return {
+    navigates: fields.navigates !== undefined ? fields.navigates : NAVIGATING_ACTIONS[action] === true,
+    external: action === "openInBrowser",
+    note: fields.note === true,
+    form: fields.form === true,
     section: fields.section || "",
     sectionHint: fields.sectionHint || "",
     kind: fields.kind || "",
@@ -1743,6 +1757,7 @@ function infoEntry(section, label, value, tone) {
 
 function noteEntry(section, text, tone) {
   return entry({
+    note: true,
     section: section,
     kind: "",
     glyph: "",
@@ -2156,46 +2171,63 @@ function serverFields(server) {
 
   var cli = server.transport === "cli"
   var tls = server.tls || {}
+
+  // Grouped, because eleven fields in one flat run gives no clue which of them
+  // you actually came to change. Where to reach it, what proves who you are,
+  // and what you are allowed to see are three different questions.
   var fields = [
-    { key: "label", label: "Label", value: server.label, hint: "What the panel calls it" },
-    { key: "transport", label: "Transport", value: server.transport, kind: "toggle",
-      hint: cli ? "shells out to the temporal CLI" : "talks to the HTTP API" }
+    { group: "CONNECTION", key: "label", label: "Label", value: server.label,
+      hint: "what the panel calls it" },
+    { group: "CONNECTION", key: "transport", label: "Transport", value: server.transport,
+      kind: "toggle", hint: cli ? "shells out to the temporal CLI" : "talks to the HTTP API" }
   ]
 
   if (cli) {
-    fields.push({ key: "address", label: "gRPC address", value: server.address,
-      hint: "host:7233" })
-    fields.push({ key: "profile", label: "CLI profile", value: server.profile,
-      hint: "a profile name from temporal.toml — brings its own credentials" })
+    fields.push({ group: "CONNECTION", key: "address", label: "gRPC address", value: server.address,
+      hint: "host and port the CLI dials, e.g. temporal.internal:7233" })
+    fields.push({ group: "CONNECTION", key: "profile", label: "CLI profile", value: server.profile,
+      hint: "a profile from temporal.toml — brings its own address and credentials" })
   } else {
-    fields.push({ key: "url", label: "HTTP API url", value: server.url,
-      hint: "http://host:7243" })
+    fields.push({ group: "CONNECTION", key: "url", label: "HTTP API url", value: server.url,
+      hint: "base url of the HTTP API, e.g. http://temporal.internal:7243" })
   }
 
-  fields.push({ key: "uiUrl", label: "Web UI url", value: server.uiUrl,
+  fields.push({ group: "CONNECTION", key: "uiUrl", label: "Web UI url", value: server.uiUrl,
     hint: "where Enter on a workflow should open" })
 
-  fields.push({ key: "apiKeyCommand", label: "Key command", value: server.apiKeyCommand,
-    hint: "preferred: a command that prints the token, e.g. pass show temporal/prod" })
-  fields.push({ key: "apiKey", label: "API key", value: server.apiKey, secret: true,
-    hint: "stored in plain text — use a key command instead where you can" })
-
-  fields.push({ key: "headers", label: "Headers", value: headerLines(server.headers).join(", "),
-    hint: "Name: value, comma separated. For Cloudflare Access and friends" })
-  fields.push({ key: "namespaces", label: "Namespaces",
-    value: (server.namespaces || []).join(", "),
-    hint: "pin these when the credential cannot list them" })
+  fields.push({ group: "CREDENTIALS", key: "apiKeyCommand", label: "Key command",
+    value: server.apiKeyCommand,
+    hint: "preferred — a command that prints the token, re-run as it expires" })
+  fields.push({ group: "CREDENTIALS", key: "apiKey", label: "API key", value: server.apiKey,
+    secret: true, hint: "stored in plain text; prefer the key command above" })
+  fields.push({ group: "CREDENTIALS", key: "headers", label: "Headers",
+    value: headerLines(server.headers).join(", "),
+    hint: "Name: value, comma separated — for Cloudflare Access and similar" })
 
   if (cli) {
-    fields.push({ key: "tlsCertPath", label: "Client cert", value: tls.certPath || "",
-      hint: "mTLS: path to the client certificate" })
-    fields.push({ key: "tlsKeyPath", label: "Client key", value: tls.keyPath || "",
-      hint: "mTLS: path to the private key" })
-    fields.push({ key: "tlsCaPath", label: "Server CA", value: tls.caPath || "",
-      hint: "path to the CA that signed the server" })
+    fields.push({ group: "CREDENTIALS", key: "tlsCertPath", label: "Client cert",
+      value: tls.certPath || "", hint: "mTLS: path to the client certificate" })
+    fields.push({ group: "CREDENTIALS", key: "tlsKeyPath", label: "Client key",
+      value: tls.keyPath || "", hint: "mTLS: path to the private key" })
+    fields.push({ group: "CREDENTIALS", key: "tlsCaPath", label: "Server CA",
+      value: tls.caPath || "", hint: "path to the CA that signed the server" })
   }
 
+  fields.push({ group: "SCOPE", key: "namespaces", label: "Namespaces",
+    value: (server.namespaces || []).join(", "),
+    hint: "pin these when the credential is not allowed to list them" })
+
   return fields
+}
+
+var FIELD_GROUP_HINT = {
+  CONNECTION: "Where this server is and how the plugin reaches it.",
+  CREDENTIALS: "What proves who you are. Enter changes a field, Esc goes back.",
+  SCOPE: "What this credential is allowed to see."
+}
+
+function fieldGroupHint(group) {
+  return FIELD_GROUP_HINT[group] || ""
 }
 
 // Apply one edited field to a server's *config* form, so the result can go

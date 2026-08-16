@@ -300,6 +300,20 @@ Item {
     return Model.addVerdict(normalized, parsed.warnings)
   }
 
+  // Jump straight to one server's credentials, for `omtemporal edit <label>`
+  // and for a keybind that goes where the token needs changing.
+  function editByLabel(label) {
+    var wanted = String(label || "").trim()
+    if (wanted === "") return "usage: edit <label>"
+    for (var i = 0; i < shownServers.length; i++) {
+      if (shownServers[i].label === wanted) {
+        openEditor(i)
+        return "editing " + wanted
+      }
+    }
+    return "no server labelled " + wanted
+  }
+
   function removeByLabel(label) {
     var wanted = String(label || "").trim()
     if (wanted === "") return "usage: remove <label>"
@@ -484,10 +498,14 @@ Item {
         ? "•".repeat(Math.min(12, String(field.value).length))
         : String(field.value || "")
       out.push(Model.entry({
-        section: "EDITING " + server.label.toUpperCase(),
-        sectionHint: "Enter changes a field. Esc goes back.",
-        kind: field.key === "transport" ? "server" : "",
-        glyph: field.secret ? "󰌋" : "",
+        form: true,
+        section: field.group,
+        sectionHint: Model.fieldGroupHint(field.group),
+        kind: "",
+        // No per-field glyphs: a single key icon on one row of a form pulls the
+        // eye to whichever field happens to have it rather than to the one you
+        // came to change.
+        glyph: "",
         title: field.label,
         subtitle: field.hint || "",
         trailing: shown === "" ? "—" : shown,

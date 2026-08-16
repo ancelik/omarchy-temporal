@@ -20,6 +20,7 @@ Usage: omtemporal <command> [args]
   add <target> [label] [option=value ...]
                          Add a server
   remove <label>         Remove a server
+  edit <label>           Open its credentials in the panel
   status                 One-line summary of the whole fleet
   doctor                 Check every server, and why one might be empty
   open [level ...]       Open the panel, optionally at a level
@@ -85,6 +86,12 @@ cmd_add() {
   require_widget
   [[ $# -ge 1 ]] || fail "add needs a target. See: omtemporal --help"
   ipc add "$*"
+}
+
+cmd_edit() {
+  require_widget
+  [[ $# -ge 1 ]] || fail "edit needs a label"
+  ipc edit "$*"
 }
 
 cmd_remove() {
@@ -342,6 +349,7 @@ setup) cmd_setup "$@" ;;
 list) cmd_list "$@" ;;
 add) cmd_add "$@" ;;
 remove) cmd_remove "$@" ;;
+edit) cmd_edit "$@" ;;
 status) cmd_status "$@" ;;
 doctor) cmd_doctor "$@" ;;
 open) cmd_open "$@" ;;

@@ -23,7 +23,7 @@ Column {
   signal activated(var entry)
   signal hovered(int index)
 
-  spacing: Style.space(2)
+  spacing: 0
 
   Repeater {
     model: root.entries
@@ -42,8 +42,11 @@ Column {
         && (previous === null || String(previous.section || "") !== section)
 
       width: root.width
-      spacing: Style.space(4)
-      topPadding: opensSection && index > 0 ? Style.space(10) : 0
+      spacing: Style.space(3)
+      // A uniform gap above every section but the first, so the eye can find
+      // the groups without counting.
+      topPadding: opensSection ? (index > 0 ? Style.space(20) : 0) : Style.space(1)
+      bottomPadding: opensSection ? Style.space(2) : 0
 
       PanelSectionHeader {
         visible: group.opensSection
@@ -62,7 +65,7 @@ Column {
         font.family: root.fontFamily
         font.pixelSize: Style.font.caption
         wrapMode: Text.WordWrap
-        bottomPadding: Style.space(2)
+        bottomPadding: Style.space(5)
       }
 
       PrimitiveRow {
