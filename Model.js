@@ -2133,3 +2133,111 @@ function clampSelectable(entries, index) {
   if (index >= 0 && index < list.length && list[index].selectable) return index
   return firstSelectable(list)
 }
+
+// --- editing a server's credentials from the panel -------------------------------------
+//
+// Credentials used to be a shell.json job, which is a poor place to send anyone
+// holding a fresh API key. These describe the editable surface so the setup
+// screen can render a form without knowing anything about auth, and so the
+// field list stays testable without a running shell.
+
+function headerLines(headers) {
+  var out = []
+  var map = headers || {}
+  for (var name in map) out.push(name + ": " + map[name])
+  out.sort()
+  return out
+}
+
+// `secret` fields render masked. `toggle` fields have no text entry -- Enter
+// just cycles them, because a two-value field is not worth a keyboard prompt.
+function serverFields(server) {
+  if (!server) return []
+
+  var cli = server.transport === "cli"
+  var tls = server.tls || {}
+  var fields = [
+    { key: "label", label: "Label", value: server.label, hint: "What the panel calls it" },
+    { key: "transport", label: "Transport", value: server.transport, kind: "toggle",
+      hint: cli ? "shells out to the temporal CLI" : "talks to the HTTP API" }
+  ]
+
+  if (cli) {
+    fields.push({ key: "address", label: "gRPC address", value: server.address,
+      hint: "host:7233" })
+    fields.push({ key: "profile", label: "CLI profile", value: server.profile,
+      hint: "a profile name from temporal.toml — brings its own credentials" })
+  } else {
+    fields.push({ key: "url", label: "HTTP API url", value: server.url,
+      hint: "http://host:7243" })
+  }
+
+  fields.push({ key: "uiUrl", label: "Web UI url", value: server.uiUrl,
+    hint: "where Enter on a workflow should open" })
+
+  fields.push({ key: "apiKeyCommand", label: "Key command", value: server.apiKeyCommand,
+    hint: "preferred: a command that prints the token, e.g. pass show temporal/prod" })
+  fields.push({ key: "apiKey", label: "API key", value: server.apiKey, secret: true,
+    hint: "stored in plain text — use a key command instead where you can" })
+
+  fields.push({ key: "headers", label: "Headers", value: headerLines(server.headers).join(", "),
+    hint: "Name: value, comma separated. For Cloudflare Access and friends" })
+  fields.push({ key: "namespaces", label: "Namespaces",
+    value: (server.namespaces || []).join(", "),
+    hint: "pin these when the credential cannot list them" })
+
+  if (cli) {
+    fields.push({ key: "tlsCertPath", label: "Client cert", value: tls.certPath || "",
+      hint: "mTLS: path to the client certificate" })
+    fields.push({ key: "tlsKeyPath", label: "Client key", value: tls.keyPath || "",
+      hint: "mTLS: path to the private key" })
+    fields.push({ key: "tlsCaPath", label: "Server CA", value: tls.caPath || "",
+      hint: "path to the CA that signed the server" })
+  }
+
+  return fields
+}
+
+// Apply one edited field to a server's *config* form, so the result can go
+// straight back through normalizeServer and be persisted.
+function applyServerField(server, key, value) {
+  var config = serverToConfig(server)
+  var text = String(value === undefined || value === null ? "" : value).trim()
+
+  switch (key) {
+  case "transport":
+    // The only toggle. Flipping it keeps whichever address the other side can
+    // use, so switching back and forth does not quietly lose the endpoint.
+    config.transport = server.transport === "http" ? "cli" : "http"
+    if (config.transport === "cli" && !config.address && server.url) {
+      config.address = hostOf(server.url)
+    }
+    break
+  case "headers":
+    var headers = normalizeHeaders(text === "" ? null : text.split(","))
+    if (headerCount(headers) > 0) config.headers = headers
+    else delete config.headers
+    break
+  case "namespaces":
+    var names = text === "" ? [] : text.split(",").map(function (n) { return n.trim() })
+      .filter(function (n) { return n !== "" })
+    if (names.length > 0) config.namespaces = names
+    else delete config.namespaces
+    break
+  case "tlsCertPath":
+  case "tlsKeyPath":
+  case "tlsCaPath":
+    if (text === "") delete config[key]
+    else config[key] = text
+    break
+  default:
+    if (text === "") delete config[key]
+    else config[key] = text
+    break
+  }
+
+  // A label is the one field that cannot be blank: it is how remove and the
+  // breadcrumb find the server again.
+  if (!config.label) config.label = hostOf(config.url) || config.address || config.profile || "server"
+  return config
+}

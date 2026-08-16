@@ -478,7 +478,26 @@ Panel {
         root.moveCursor(dy)
       }
       onActivateRequested: if (root.cursorActive) root.activateEntry(root.selectedEntry())
-      onCloseRequested: root.ascend()
+      onDeleteRequested: {
+        var entry = root.selectedEntry()
+        if (root.onboarding && entry && String(entry.action) === "editServer") {
+          setup.removeServer(entry.payload.index)
+        }
+      }
+      onCloseRequested: {
+        // Unwind the editing stack before the navigation one, so Esc never
+        // throws away a half-typed credential by closing the whole panel.
+        if (root.onboarding && setup.editField !== "") {
+          setup.editField = ""
+          keyCatcher.forceActiveFocus()
+          return
+        }
+        if (root.onboarding && setup.editIndex >= 0) {
+          setup.closeEditor()
+          return
+        }
+        root.ascend()
+      }
       onTabRequested: function (direction) { root.switchPanel(direction) }
       onTextKey: function (text) {
         if (text === "r" || text === "R") {
@@ -631,18 +650,40 @@ Panel {
             }
           }
 
+          // One field serves both jobs: typing a new server's address, and
+          // editing any field of an existing one, credentials included.
           TextField {
             id: addField
-            visible: root.onboarding && setup.adding
+            visible: root.onboarding && (setup.adding || setup.editField !== "")
             width: parent.width
-            placeholderText: "http://host:7243  or  host:7233"
+            password: setup.editField !== "" && setup.editSecret
+            placeholderText: setup.editField !== ""
+              ? (setup.editSecret ? "new value — blank leaves it unchanged" : setup.editLabel)
+              : "http://host:7243  or  host:7233"
             foreground: root.foreground
             onAccepted: {
-              setup.addManual(text)
+              if (setup.editField !== "") setup.commitField(text)
+              else setup.addManual(text)
               text = ""
               keyCatcher.forceActiveFocus()
             }
-            onVisibleChanged: if (visible) Qt.callLater(function () { addField.forceActiveFocus() })
+            // Opening a field pre-fills it so an edit is a tweak rather than a
+            // retype; secrets deliberately come up blank.
+            onVisibleChanged: if (visible) {
+              text = setup.editField !== "" ? setup.editValue : ""
+              Qt.callLater(function () { addField.forceActiveFocus(); addField.selectAll() })
+            }
+          }
+
+          // Reopening the prompt for a different field has to refill it, since
+          // the field never became invisible in between.
+          Connections {
+            target: setup
+            function onEditFieldChanged() {
+              if (setup.editField === "") return
+              addField.text = setup.editValue
+              Qt.callLater(function () { addField.forceActiveFocus(); addField.selectAll() })
+            }
           }
 
           Text {
@@ -659,7 +700,9 @@ Panel {
           Text {
             width: parent.width
             text: root.onboarding
-              ? "enter select · a add by hand · r rescan · esc back"
+              ? (setup.editIndex >= 0
+                ? "enter change · esc back · credentials are saved as you go"
+                : "enter edit · x remove · a add by hand · r rescan · esc back")
               : "j/k move · enter open · h back · f filter · r refresh · o web ui · s servers"
             color: root.dim
             opacity: 0.75

@@ -140,8 +140,8 @@ cmd_setup() {
   done < <(
     # HTTP first: it is the transport people should prefer when it is available.
     for port in 7243 7244 7245; do
-      if curl -sf -m 2 "http://localhost:$port/api/v1/cluster-info" >/dev/null 2>&1; then
-        printf 'http://localhost:%s\tlocalhost:%s (HTTP API)\n' "$port" "$port"
+      if curl -sf -m 2 "http://127.0.0.1:$port/api/v1/cluster-info" >/dev/null 2>&1; then
+        printf 'http://127.0.0.1:%s\t127.0.0.1:%s (HTTP API)\n' "$port" "$port"
       fi
     done
     jq -r '.grpc[]? | select(.ok) | "\(.address)\t\(.address) (gRPC, via CLI)"' <<<"$found"

@@ -25,8 +25,14 @@ Item {
   // Ports a dev server is conventionally reachable on. `temporal server
   // start-dev --http-port 7243` is the documented incantation, and the test bed
   // and most local setups follow it.
+  // 127.0.0.1 rather than localhost, deliberately. Docker publishes a port on
+  // both stacks, `localhost` resolves to ::1 first, and a broken or filtered
+  // IPv6 path then costs a full connect timeout per probe -- the Go gRPC client
+  // does not fall back to IPv4 the way curl does, so the CLI simply hangs while
+  // the HTTP API looks fine. Probing the v4 address avoids the whole trap.
   property var httpPorts: [7243, 7244, 7245]
-  property var grpcAddresses: ["localhost:7233", "localhost:7234", "localhost:7235"]
+  property string probeHost: "127.0.0.1"
+  property var grpcAddresses: ["127.0.0.1:7233", "127.0.0.1:7234", "127.0.0.1:7235"]
 
   property bool scanning: false
   property bool cliAvailable: true
@@ -35,6 +41,16 @@ Item {
   property var profiles: []
   property string status: ""
   property bool adding: false
+
+  // Editing one server's fields, credentials included. -1 is the server list.
+  property int editIndex: -1
+  property string editField: ""
+  property string editLabel: ""
+  property string editValue: ""
+  property bool editSecret: false
+
+  readonly property var editServer: editIndex >= 0 && editIndex < servers.length
+    ? servers[editIndex] : null
 
   readonly property var entries: buildEntries()
 
@@ -57,7 +73,7 @@ Item {
   // Probed straight from QML: an HTTP server needs no CLI to find, and this is
   // the transport most people should end up on.
   function probeHttp(port) {
-    var base = "http://localhost:" + port
+    var base = "http://" + probeHost + ":" + port
     var xhr = new XMLHttpRequest()
     xhr.onreadystatechange = function () {
       if (xhr.readyState !== XMLHttpRequest.DONE) return
@@ -102,7 +118,7 @@ Item {
   }
 
   function probeUi(base, uiPort) {
-    var uiUrl = "http://localhost:" + uiPort
+    var uiUrl = "http://" + probeHost + ":" + uiPort
     var xhr = new XMLHttpRequest()
     xhr.onreadystatechange = function () {
       if (xhr.readyState !== XMLHttpRequest.DONE) return
@@ -196,12 +212,16 @@ Item {
     return false
   }
 
-  function addServer(config) {
+  function addServer(config, thenEdit) {
     var list = []
     for (var i = 0; i < servers.length; i++) list.push(servers[i])
     list.push(Model.normalizeServer(config, list.length))
     persist(list)
     status = "Added " + config.label
+    // A candidate that answered 401/403 during discovery is going to need
+    // credentials immediately, so open the editor rather than leaving a row
+    // that just says "token rejected".
+    if (thenEdit) openEditor(list.length - 1)
   }
 
   function removeServer(index) {
@@ -280,6 +300,8 @@ Item {
   // --- entries ---------------------------------------------------------------------
 
   function buildEntries() {
+    if (editServer) return buildFieldEntries()
+
     var out = []
 
     // What is configured now
@@ -292,14 +314,14 @@ Item {
         var summary = Model.authSummary(server)
         out.push(Model.entry({
           section: "CONFIGURED SERVERS",
-          sectionHint: "Enter removes one.",
+          sectionHint: "Enter to edit credentials and addresses. x removes one.",
           kind: "server",
           title: server.label,
           subtitle: Model.serverAddressText(server) + "  ·  " + server.transport
             + (summary.text === "none" ? "" : "  ·  " + summary.text),
-          trailing: "remove",
+          trailing: "edit",
           tone: "dim",
-          action: "removeServer",
+          action: "editServer",
           payload: { index: i }
         }))
         // Anything already known to be wrong with this server's credentials,
@@ -420,6 +442,110 @@ Item {
 
   // --- actions -----------------------------------------------------------------------
 
+  // One entry per editable field. Secrets show their length, never their value:
+  // a bar panel is a screen-sharing hazard and the key is already stored.
+  function buildFieldEntries() {
+    var out = []
+    var server = editServer
+    var fields = Model.serverFields(server)
+
+    for (var i = 0; i < fields.length; i++) {
+      var field = fields[i]
+      var shown = field.secret && field.value
+        ? "•".repeat(Math.min(12, String(field.value).length))
+        : String(field.value || "")
+      out.push(Model.entry({
+        section: "EDITING " + server.label.toUpperCase(),
+        sectionHint: "Enter changes a field. Esc goes back.",
+        kind: field.key === "transport" ? "server" : "",
+        glyph: field.secret ? "󰌋" : "",
+        title: field.label,
+        subtitle: field.hint || "",
+        trailing: shown === "" ? "—" : shown,
+        tone: shown === "" ? "dim" : "normal",
+        action: field.kind === "toggle" ? "toggleField" : "editField",
+        payload: { key: field.key, label: field.label, value: field.value, secret: field.secret === true }
+      }))
+    }
+
+    var issues = Model.authConfigIssues(server)
+    for (var k = 0; k < issues.length; k++) {
+      out.push(Model.noteEntry("PROBLEMS", issues[k].text,
+        issues[k].level === "error" ? "bad" : "dim"))
+    }
+
+    out.push(Model.entry({
+      section: "THIS SERVER",
+      kind: "",
+      glyph: "󰄬",
+      title: "Done",
+      subtitle: "back to the server list",
+      action: "backToList"
+    }))
+    out.push(Model.entry({
+      section: "THIS SERVER",
+      kind: "",
+      glyph: "󰅖",
+      title: "Remove this server",
+      tone: "bad",
+      action: "removeEdited"
+    }))
+    return out
+  }
+
+  function openEditor(index) {
+    editIndex = index
+    editField = ""
+    status = ""
+  }
+
+  function closeEditor() {
+    editIndex = -1
+    editField = ""
+  }
+
+  function beginField(payload) {
+    editField = String(payload.key)
+    editLabel = String(payload.label)
+    // A secret starts blank rather than pre-filled: retyping it is safer than
+    // editing something the panel just put on screen, and blank means "leave it".
+    editValue = payload.secret ? "" : String(payload.value || "")
+    editSecret = payload.secret === true
+  }
+
+  function commitField(text) {
+    var server = editServer
+    if (!server) return
+    var value = String(text === undefined || text === null ? "" : text)
+
+    // Submitting an untouched secret prompt should not wipe the stored key.
+    if (editSecret && value === "") {
+      editField = ""
+      return
+    }
+
+    var updated = Model.applyServerField(server, editField, value)
+    var list = []
+    for (var i = 0; i < servers.length; i++) {
+      list.push(i === editIndex ? Model.normalizeServer(updated, i) : servers[i])
+    }
+    persist(list)
+    status = editLabel + " updated"
+    editField = ""
+  }
+
+  function toggleField(payload) {
+    var server = editServer
+    if (!server) return
+    var updated = Model.applyServerField(server, String(payload.key), "")
+    var list = []
+    for (var i = 0; i < servers.length; i++) {
+      list.push(i === editIndex ? Model.normalizeServer(updated, i) : servers[i])
+    }
+    persist(list)
+    status = String(payload.label) + " changed"
+  }
+
   function activate(entry) {
     if (!entry) return false
     switch (String(entry.action)) {
@@ -429,7 +555,7 @@ Item {
         url: entry.payload.url,
         uiUrl: entry.payload.uiUrl,
         transport: "http"
-      })
+      }, entry.payload.needsAuth === true)
       return true
     case "addGrpc":
       addServer({
@@ -444,6 +570,23 @@ Item {
         profile: entry.payload.name,
         transport: "cli"
       })
+      return true
+    case "editServer":
+      openEditor(entry.payload.index)
+      return true
+    case "editField":
+      beginField(entry.payload)
+      return true
+    case "toggleField":
+      toggleField(entry.payload)
+      return true
+    case "backToList":
+      closeEditor()
+      return true
+    case "removeEdited":
+      var doomed = editIndex
+      closeEditor()
+      removeServer(doomed)
       return true
     case "removeServer":
       removeServer(entry.payload.index)

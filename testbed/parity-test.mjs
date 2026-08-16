@@ -14,8 +14,8 @@ import { fileURLToPath } from "node:url"
 import { dirname, join } from "node:path"
 
 const here = dirname(fileURLToPath(import.meta.url))
-const HTTP = process.env.OMT_HTTP || "http://localhost:7243"
-const GRPC = process.env.OMT_GRPC || "localhost:7233"
+const HTTP = process.env.OMT_HTTP || "http://127.0.0.1:7243"
+const GRPC = process.env.OMT_GRPC || "127.0.0.1:7233"
 const NS = process.env.OMT_NS || "orders"
 
 // Model.js is a QML .js include, not a module: it has no exports and expects to
@@ -29,7 +29,7 @@ const EXPORTS = [
   "routeWorkflow", "detailKey", "taskQueuesFromExecutions", "mergeTaskQueue",
   "fleetEntries", "serverEntries", "namespaceEntries", "workflowDetailEntries",
   "taskQueueEntries", "firstSelectable", "nextSelectable", "primitiveGlyph",
-  "namespaceFailure",
+  "namespaceFailure", "serverFields", "applyServerField", "headerLines",
   "authSummary", "authConfigIssues", "hasConfigError", "httpHeaders", "authSpec",
   "classifyError", "errorMessage", "namespaceFallback", "redact", "serverSecrets",
   "authReport", "failureWord", "normalizeServer", "clusterUrl", "namespacesUrl",
@@ -715,6 +715,55 @@ check("disagreeing failures still stop claiming success",
 check("a QVariant-style sequence is accepted",
   Model.namespaceFailure({ length: 1, 0: ns({ error: "x", errorKind: "auth" }) }),
   { error: "x", kind: "auth" })
+
+// --- editing a server from the panel ------------------------------------------------------
+//
+// Credentials are enterable in the UI, so the field list and the edits it
+// produces have to be right without a shell to try them in.
+
+console.log("\nserver field editor")
+const httpServer = Model.normalizeServers([{ label: "s", url: "http://h:7243" }])[0]
+const cliServer = Model.normalizeServers([{ label: "s", address: "h:7233", transport: "cli" }])[0]
+const keyOf = (s) => Model.serverFields(s).map(f => f.key)
+
+check("http offers a url, not a gRPC address",
+  keyOf(httpServer).includes("url") && !keyOf(httpServer).includes("address"), true)
+check("cli offers an address and a profile",
+  keyOf(cliServer).includes("address") && keyOf(cliServer).includes("profile"), true)
+check("tls paths only where they can be used",
+  [keyOf(httpServer).includes("tlsCertPath"), keyOf(cliServer).includes("tlsCertPath")], [false, true])
+check("both offer a key and a key command",
+  ["apiKey", "apiKeyCommand"].every(k => keyOf(httpServer).includes(k)), true)
+check("only the api key is marked secret",
+  Model.serverFields(httpServer).filter(f => f.secret).map(f => f.key), ["apiKey"])
+check("transport is the only toggle",
+  Model.serverFields(httpServer).filter(f => f.kind === "toggle").map(f => f.key), ["transport"])
+
+const edit = (server, key, value) =>
+  Model.normalizeServers([Model.applyServerField(server, key, value)])[0]
+
+check("a typed key is stored", edit(httpServer, "apiKey", "abc").apiKey, "abc")
+check("headers parse from one comma-separated line",
+  edit(httpServer, "headers", "CF-Access-Client-Id: a, CF-Access-Client-Secret: b").headers,
+  { "CF-Access-Client-Id": "a", "CF-Access-Client-Secret": "b" })
+check("headers round trip back to editable text",
+  Model.headerLines(edit(httpServer, "headers", "A: 1, B: 2").headers).join(", "), "A: 1, B: 2")
+check("namespaces parse and trim", edit(httpServer, "namespaces", " orders , payments ").namespaces,
+  ["orders", "payments"])
+check("blanking a field clears it",
+  edit(edit(httpServer, "apiKey", "abc"), "apiKey", "").apiKey, "")
+check("blanking namespaces clears them",
+  edit(edit(httpServer, "namespaces", "a,b"), "namespaces", "").namespaces, [])
+check("flipping transport keeps a reachable address",
+  [edit(httpServer, "transport", "").transport, edit(httpServer, "transport", "").address],
+  ["cli", "h:7243"])
+check("an emptied label falls back rather than vanishing",
+  edit(httpServer, "label", "").label, "h:7243")
+check("editing one field leaves the others alone", (() => {
+  let s = edit(httpServer, "apiKey", "abc")
+  s = edit(s, "namespaces", "orders")
+  return [s.apiKey, s.namespaces, s.url]
+})(), ["abc", ["orders"], "http://h:7243"])
 
 console.log(`\n${checks - failures}/${checks} passed`)
 process.exit(failures === 0 ? 0 : 1)

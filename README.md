@@ -171,6 +171,12 @@ omtemporal open namespace 0 orders            # jump straight to a level
 `add` and `remove` call into the running widget, so the terminal and the panel
 share one implementation and cannot drift apart.
 
+Credentials are editable from the panel too — press `s` for the server list,
+Enter on a server, and every field is there: API key, key command, headers,
+pinned namespaces, TLS paths and the transport. Keys are entered masked and
+shown only as their length afterwards, and an empty submission leaves a stored
+key untouched rather than wiping it.
+
 `omtemporal doctor` is the first thing to run when something looks wrong: it
 checks the shell, the widget, the CLI, every server's reachability, whether each
 HTTP server's API is actually enabled — and, since that is now the leading cause
