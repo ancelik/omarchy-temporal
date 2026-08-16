@@ -179,10 +179,11 @@ Item {
       if (servers[j].transport === "cli") startCliPoll(generation, j)
       else startHttpPoll(generation, j)
     }
-    // A fleet where every server is misconfigured never releases an
-    // outstanding request, so the poll has to be able to settle without one.
-    settleIfDone()
     watchdog.restart()
+    // A fleet where every server is misconfigured never releases an
+    // outstanding request, so the poll has to be able to settle without one --
+    // after the watchdog is armed, because settling is what disarms it.
+    settleIfDone()
 
     // Whatever level is on screen stays live alongside the poll it belongs to.
     // Forced, because a fetch left in flight from the previous tick would
@@ -831,10 +832,24 @@ Item {
     return ["bash", "-lc", "exec python3 \"$0\" -", root.collectorPath]
   }
 
-  function readCollectorOutput(text, stderrText, exitCode) {
+  // `serverIndex` is only for redaction: collect.py scrubs its own output, but
+  // stderr belongs to whatever went wrong before it got to run.
+  function readCollectorOutput(text, stderrText, exitCode, serverIndex) {
+    var secrets = Model.serverSecrets(servers[serverIndex], apiKeyRecordValue(serverIndex))
+
     var raw = String(text || "").trim()
     if (raw === "") {
-      return { payload: null, error: Model.errorMessage(stderrText, exitCode || 1) || "no output from collect.py" }
+      // The collector prints a JSON error for everything it can foresee, so an
+      // empty stdout means it died before it could: no python, killed, out of
+      // memory. Its stderr is the only evidence there is -- and an exit code is
+      // not an HTTP status, so it is not handed to the classifier as one.
+      var stderr = Model.redact(stderrText, secrets).trim()
+      return {
+        payload: null,
+        error: stderr !== ""
+          ? Model.errorMessage(stderr, 0)
+          : "collect.py exited " + (exitCode || 1) + " without output"
+      }
     }
     var parsed = null
     try {
@@ -842,8 +857,15 @@ Item {
     } catch (error) {
       return { payload: null, error: "unreadable collector output" }
     }
-    if (parsed && parsed.ok === false) return { payload: null, error: String(parsed.error || "temporal failed") }
+    if (parsed && parsed.ok === false) {
+      return { payload: null, error: Model.redact(String(parsed.error || "temporal failed"), secrets) }
+    }
     return { payload: parsed, error: "" }
+  }
+
+  function apiKeyRecordValue(index) {
+    var record = _apiKeys[index]
+    return record && record.value ? String(record.value) : ""
   }
 
   // One long-lived process slot per server, reused each poll.
@@ -880,7 +902,7 @@ Item {
       stderr: StdioCollector { id: pollErr; waitForEnd: true }
 
       onExited: function (exitCode) {
-        var result = root.readCollectorOutput(pollOut.text, pollErr.text, exitCode)
+        var result = root.readCollectorOutput(pollOut.text, pollErr.text, exitCode, pollProcess.index)
         root.applyCliPoll(pollProcess.generation, pollProcess.index, result.payload, result.error)
       }
     }
@@ -914,7 +936,8 @@ Item {
     stderr: StdioCollector { id: detailErr; waitForEnd: true }
 
     onExited: function (exitCode) {
-      var result = root.readCollectorOutput(detailOut.text, detailErr.text, exitCode)
+      var result = root.readCollectorOutput(detailOut.text, detailErr.text, exitCode,
+        detailRunner.route ? detailRunner.route.serverIndex : -1)
       root.applyCliDetail(detailRunner.generation, detailRunner.key, detailRunner.route,
         result.payload, result.error)
     }
@@ -936,7 +959,11 @@ Item {
 
       readonly property string keyCommand: String(modelData.apiKeyCommand || "")
 
-      command: ["bash", "-lc", keyCommand]
+      // Bounded, because the poll waits for this. A `pass` whose pinentry has
+      // nowhere to draw itself hangs forever, and without the limit it would
+      // take the whole widget with it: every refresh stands down while a key is
+      // outstanding, so a key that never lands means a panel that never updates.
+      command: ["timeout", "20", "bash", "-lc", keyCommand]
 
       function resolve() {
         if (keyCommand === "" || keyProcess.running) return false

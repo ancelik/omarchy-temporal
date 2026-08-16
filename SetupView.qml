@@ -231,85 +231,24 @@ Item {
   // `omtemporal add|remove|list` calls straight into these, so the terminal and
   // the panel cannot drift apart in how they interpret an address.
 
-  // Options a server can be added with, spelled the way shell.json spells them
-  // so there is one vocabulary to learn. `header` is repeatable and takes
-  // "Name: value", which is how a proxy's own instructions write it.
-  readonly property var addOptions: ({
-    apiKey: "string", apiKeyCommand: "string", apiKeyTtlSec: "string",
-    uiUrl: "string", namespaces: "string", transport: "string",
-    tls: "bool", tlsCertPath: "string", tlsKeyPath: "string", tlsCaPath: "string",
-    tlsServerName: "string", tlsDisableHostVerification: "bool",
-    header: "header"
-  })
-
   function addFromCli(spec) {
-    var value = String(spec || "").trim()
-    if (value === "") return "usage: add <url|host:port|profile:NAME> [label] [option=value ...]"
+    // Parsed in Model.js so the option grammar is checkable without a shell.
+    var parsed = Model.parseAddSpec(spec)
+    if (!parsed.ok) return parsed.message
 
-    var parts = value.split(/\s+/)
-    var target = parts[0]
-
-    // Anything after the target that looks like a known option is one; the rest
-    // is the label. Keeps `add host:7233 my prod box` working unchanged.
-    var options = {}
-    var headers = {}
-    var words = []
-    var warnings = []
-    for (var i = 1; i < parts.length; i++) {
-      var cut = parts[i].indexOf("=")
-      var name = cut > 0 ? parts[i].substring(0, cut) : ""
-      if (cut <= 0 || !addOptions[name]) {
-        words.push(parts[i])
-        continue
-      }
-      var raw = parts[i].substring(cut + 1)
-      if (addOptions[name] === "header") {
-        var split = raw.indexOf(":") === -1 ? raw.indexOf("=") : raw.indexOf(":")
-        if (split > 0) headers[raw.substring(0, split).trim()] = raw.substring(split + 1).trim()
-        continue
-      }
-      options[name] = addOptions[name] === "bool" ? (raw === "true" || raw === "1") : raw
-    }
-    if (options.apiKey) {
-      // It is already too late to keep it out of the shell history, but it is
-      // not too late to say so before it goes into shell.json in the clear.
-      warnings.push("apiKey is now in your shell history and in shell.json; apiKeyCommand avoids both")
-    }
-    var label = words.join(" ")
-
-    var config = null
-    if (target.indexOf("profile:") === 0) {
-      config = { profile: target.substring(8), transport: "cli" }
-      config.label = label || config.profile
-    } else if (target.match(/^https?:\/\//)) {
-      config = { url: target, transport: "http" }
-      config.label = label || Model.hostOf(target)
-    } else {
-      config = { address: target, transport: "cli" }
-      config.label = label || target
-    }
-
-    for (var key in options) config[key] = options[key]
-    if (Object.keys(headers).length > 0) config.headers = headers
-
+    var config = parsed.config
     if (alreadyConfigured(config)) return "already configured: " + config.label
 
-    // Normalized before the verdict so mTLS moving the entry onto the cli
-    // transport, or a config that cannot work at all, is reported now rather
-    // than discovered as an empty panel later.
+    // Normalized before the verdict, so mTLS moving the entry onto the cli
+    // transport -- or a config that cannot work at all -- is reported now
+    // rather than discovered later as an empty panel.
     var normalized = Model.normalizeServer(config, servers.length)
-    if (!normalized) return "cannot read that as a server: " + target
+    if (!normalized) return "cannot read that as a server"
     var fatal = Model.hasConfigError(normalized)
     if (fatal !== "") return "not added — " + fatal
 
     addServer(config)
-    var lines = ["added " + normalized.label + " (" + normalized.transport + ", "
-      + Model.authSummary(normalized).text + ")"]
-    if (normalized.transportNote) lines.push(normalized.transportNote)
-    var issues = Model.authConfigIssues(normalized)
-    for (var j = 0; j < issues.length; j++) lines.push(issues[j].level + ": " + issues[j].text)
-    for (var w = 0; w < warnings.length; w++) lines.push("warn: " + warnings[w])
-    return lines.join("\n")
+    return Model.addVerdict(normalized, parsed.warnings)
   }
 
   function removeByLabel(label) {

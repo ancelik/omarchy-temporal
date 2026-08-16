@@ -651,6 +651,111 @@ function authSpec(server, apiKey) {
   }
 }
 
+// --- the `add` command line ---------------------------------------------------------
+
+// Options a server can be added with, spelled exactly the way shell.json spells
+// them so there is one vocabulary to learn rather than two.
+var ADD_OPTIONS = {
+  apiKey: "string", apiKeyCommand: "string", apiKeyTtlSec: "string",
+  uiUrl: "string", namespaces: "string", transport: "string",
+  tls: "bool", tlsCertPath: "string", tlsKeyPath: "string", tlsCaPath: "string",
+  tlsServerName: "string", tlsDisableHostVerification: "bool",
+  header: "header"
+}
+
+var ADD_USAGE = "usage: add <url|host:port|profile:NAME> [label] [option=value ...]"
+
+// Turn one line of `omtemporal add` into a server config.
+//
+// The line arrives already flattened -- the IPC takes a single string, and the
+// user's shell removed the quotes long before that -- so
+// `apiKeyCommand='pass show temporal/prod'` is five words by the time it gets
+// here. Anything following an option that is not itself an option therefore
+// belongs to that option, and only the words before the first option are the
+// label. `add host:7233 my prod box` still means what it always did.
+function parseAddSpec(spec) {
+  var value = String(spec || "").trim()
+  if (value === "") return { ok: false, message: ADD_USAGE, config: null, warnings: [] }
+
+  var parts = value.split(/\s+/)
+  var target = parts[0]
+
+  var options = {}
+  var headers = {}
+  var words = []
+  var warnings = []
+  var current = ""
+  var lastHeader = ""
+
+  for (var i = 1; i < parts.length; i++) {
+    var cut = parts[i].indexOf("=")
+    var name = cut > 0 ? parts[i].substring(0, cut) : ""
+
+    if (cut > 0 && ADD_OPTIONS[name]) {
+      current = name
+      var raw = parts[i].substring(cut + 1)
+      if (ADD_OPTIONS[name] === "header") {
+        // "Name: value" is how a proxy's own setup page writes it; "Name=value"
+        // is how someone who has just typed five other options writes it.
+        var split = raw.indexOf(":") === -1 ? raw.indexOf("=") : raw.indexOf(":")
+        lastHeader = split > 0 ? raw.substring(0, split).trim() : ""
+        if (lastHeader !== "") headers[lastHeader] = raw.substring(split + 1).trim()
+      } else if (ADD_OPTIONS[name] === "bool") {
+        options[name] = raw === "true" || raw === "1"
+      } else {
+        options[name] = raw
+      }
+      continue
+    }
+
+    if (current === "") {
+      words.push(parts[i])
+    } else if (ADD_OPTIONS[current] === "header") {
+      if (lastHeader !== "") headers[lastHeader] = (headers[lastHeader] + " " + parts[i]).trim()
+    } else if (ADD_OPTIONS[current] !== "bool") {
+      options[current] = String(options[current] || "") + " " + parts[i]
+    }
+  }
+
+  var label = words.join(" ")
+  var config = null
+  if (target.indexOf("profile:") === 0) {
+    config = { profile: target.substring(8), transport: "cli" }
+    config.label = label || config.profile
+  } else if (target.match(/^https?:\/\//)) {
+    config = { url: target, transport: "http" }
+    config.label = label || hostOf(target)
+  } else {
+    config = { address: target, transport: "cli" }
+    config.label = label || target
+  }
+
+  for (var key in options) config[key] = options[key]
+  if (headerCount(headers) > 0) config.headers = headers
+
+  if (options.apiKey) {
+    // Too late to keep it out of the shell history, but not too late to say so
+    // before it also goes into shell.json in the clear.
+    warnings.push("apiKey is now in your shell history and in shell.json; apiKeyCommand avoids both")
+  }
+
+  return { ok: true, message: "", config: config, warnings: warnings }
+}
+
+// What to print once the server has been added -- or refused. Everything the
+// user needs to know that they did not just type: which transport it ended up
+// on, what credentials it carries, and anything already known to be wrong.
+function addVerdict(normalized, warnings) {
+  var lines = ["added " + normalized.label + " (" + normalized.transport + ", "
+    + authSummary(normalized).text + ")"]
+  if (normalized.transportNote) lines.push(normalized.transportNote)
+  var issues = authConfigIssues(normalized)
+  for (var i = 0; i < issues.length; i++) lines.push(issues[i].level + ": " + issues[i].text)
+  var extra = isList(warnings) ? warnings : []
+  for (var j = 0; j < extra.length; j++) lines.push("warn: " + extra[j])
+  return lines.join("\n")
+}
+
 // --- error classification ---------------------------------------------------------
 //
 // "Unreachable" and "your token expired" are different problems with different

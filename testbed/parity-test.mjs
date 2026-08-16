@@ -32,7 +32,7 @@ const EXPORTS = [
   "authSummary", "authConfigIssues", "hasConfigError", "httpHeaders", "authSpec",
   "classifyError", "errorMessage", "namespaceFallback", "redact", "serverSecrets",
   "authReport", "failureWord", "normalizeServer", "clusterUrl", "namespacesUrl",
-  "countUrl"
+  "countUrl", "parseAddSpec", "addVerdict"
 ]
 const Model = new Function(`${source}\nreturn {${EXPORTS.join(",")}}`)()
 
@@ -361,6 +361,53 @@ check("every auth field survives a normalize/serialize round trip",
 check("and a server with none of them gains none of them",
   Object.keys(Model.serversToConfig(Model.normalizeServers([{ url: "http://x:7243" }]))[0]).sort(),
   ["label", "transport", "url"])
+
+// --- the `add` command line ----------------------------------------------------------
+//
+// One string arrives over the IPC, already flattened: the user's shell removed
+// the quotes, so a value with a space in it is several words by the time it
+// gets here. Getting that wrong silently turns the rest of a key command into
+// the server's label.
+
+console.log("\nadd command line")
+
+check("nothing is a usage line", Model.parseAddSpec("").ok, false)
+check("a bare address still works",
+  Model.parseAddSpec("localhost:7233").config,
+  { address: "localhost:7233", transport: "cli", label: "localhost:7233" })
+check("a url still infers http",
+  Model.parseAddSpec("http://localhost:7243").config.transport, "http")
+check("a profile still works",
+  Model.parseAddSpec("profile:prod").config, { profile: "prod", transport: "cli", label: "prod" })
+check("a multi-word label is still a label",
+  Model.parseAddSpec("host:7233 my prod box").config.label, "my prod box")
+
+const withCommand = Model.parseAddSpec(
+  "https://temporal.corp:7243 prod apiKeyCommand=pass show temporal/prod").config
+check("a key command survives having its quotes eaten by the shell",
+  withCommand.apiKeyCommand, "pass show temporal/prod")
+check("without swallowing the label", withCommand.label, "prod")
+
+const withHeaders = Model.parseAddSpec(
+  "https://x:7243 header=CF-Access-Client-Id: abc.access header=CF-Access-Client-Secret=shh").config
+check("headers take both spellings and repeat",
+  withHeaders.headers, { "CF-Access-Client-Id": "abc.access", "CF-Access-Client-Secret": "shh" })
+
+const withTls = Model.parseAddSpec(
+  "temporal.corp:7233 prod tlsCertPath=/c.pem tlsKeyPath=/k.pem tls=false").config
+check("tls paths are picked up", [withTls.tlsCertPath, withTls.tlsKeyPath], ["/c.pem", "/k.pem"])
+check("and a boolean option is a boolean", withTls.tls, false)
+
+check("an inline key on the command line is warned about",
+  Model.parseAddSpec("https://x:7243 apiKey=abcdefghijkl").warnings.length, 1)
+check("an unknown option is treated as part of the label, not silently dropped",
+  Model.parseAddSpec("host:7233 nonsense=1").config.label, "nonsense=1")
+
+check("the verdict names the transport and the credentials",
+  Model.addVerdict(Model.normalizeServer(withTls, 0), []).split("\n")[0],
+  "added prod (cli, mTLS)")
+check("and repeats the warnings it was given",
+  Model.addVerdict(Model.normalizeServer(withTls, 0), ["careful"]).includes("warn: careful"), true)
 
 // --- authentication: what goes on the wire ------------------------------------------
 
