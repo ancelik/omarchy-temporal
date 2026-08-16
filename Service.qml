@@ -76,11 +76,29 @@ Item {
   // decrements its pending count -- so the level stayed on "Loading…" forever.
   property var _detailInflight: []
 
-  // API keys resolved from `apiKeyCommand`, keyed by server index. Requests
-  // wait for these: firing without the header would just earn a 401 and paint
-  // a scary error for the first poll of every session.
+  // API keys resolved from `apiKeyCommand`, keyed by server index:
+  // { value: "...", at: <epoch ms>, failed: bool }. Requests wait for these:
+  // firing without the header would just earn a rejection and paint a scary
+  // error for the first poll of every session.
+  //
+  // They are re-resolved when they age past the server's apiKeyTtlSec, and once
+  // more when the server rejects one. Tokens expire -- an hour is a common
+  // lifetime -- and resolving once per shell session meant a panel that worked
+  // all morning and was full of red by lunchtime.
   property var _apiKeys: ({})
   property int _pendingKeys: 0
+
+  // Servers whose token has already been re-resolved for the current poll, so a
+  // credential that is simply wrong surfaces instead of spinning.
+  property var _authRetried: ({})
+  // Servers whose last token refresh has not yet been vindicated by a good
+  // response. Only used to say "still rejected", which is the difference
+  // between "your token expired" and "your token is not the right token".
+  property var _reauthed: ({})
+
+  // A rejected credential must not turn into a password-manager prompt every
+  // poll, so re-resolution has a floor however often the server refuses us.
+  readonly property int keyRetryCooldownMs: 60000
 
   function setting(name, fallback) {
     var value = settings ? settings[name] : undefined
@@ -97,14 +115,17 @@ Item {
 
   function apiKeyFor(server) {
     if (server.apiKey !== "") return server.apiKey
-    var resolved = _apiKeys[server.index]
-    return resolved ? String(resolved) : ""
+    var record = _apiKeys[server.index]
+    return record && record.value ? String(record.value) : ""
   }
 
   // --- poll lifecycle -----------------------------------------------------------
 
   function refresh() {
     if (_pendingKeys > 0) return // the resolver calls back in
+    // Expired tokens are resolved before the poll rather than after it fails,
+    // so a long-lived session never shows a tick of red on the hour.
+    if (resolveKeys(false)) return
     cancelInflight()
 
     _generation += 1
@@ -124,6 +145,13 @@ Item {
       // the cli transport is a visible second, every time.
       var previous = i < serverStates.length && serverStates[i].label === servers[i].label
         ? serverStates[i] : null
+      // Credentials that cannot work as configured -- a client certificate on
+      // a transport that cannot present one, an HTTP url pointed at Temporal
+      // Cloud -- are reported instead of polled. Earning the same handshake
+      // failure once a tick teaches nobody anything, and the message here says
+      // what to change.
+      var configError = Model.hasConfigError(servers[i])
+
       draft.push({
         index: i,
         label: servers[i].label,
@@ -131,9 +159,11 @@ Item {
         host: Model.serverAddressText(servers[i]),
         url: servers[i].url,
         uiUrl: servers[i].uiUrl || servers[i].url,
-        ok: true,
-        pending: true,
-        error: "",
+        ok: configError === "",
+        pending: configError === "",
+        error: configError,
+        errorKind: configError === "" ? "" : "config",
+        notice: servers[i].transportNote || "",
         cluster: previous ? previous.cluster : null,
         namespaces: previous ? previous.namespaces.slice() : []
       })
@@ -145,9 +175,13 @@ Item {
     publish()
 
     for (var j = 0; j < servers.length; j++) {
+      if (_draft[j].ok === false) continue // misconfigured, already reported
       if (servers[j].transport === "cli") startCliPoll(generation, j)
       else startHttpPoll(generation, j)
     }
+    // A fleet where every server is misconfigured never releases an
+    // outstanding request, so the poll has to be able to settle without one.
+    settleIfDone()
     watchdog.restart()
 
     // Whatever level is on screen stays live alongside the poll it belongs to.
@@ -155,6 +189,82 @@ Item {
     // otherwise make this one a no-op. Previous data stays on screen while the
     // new request runs, so re-fetching does not flicker.
     if (activeRoute) fetchDetail(activeRoute, true)
+  }
+
+  // --- api key resolution ---------------------------------------------------------
+
+  // Start every apiKeyCommand that has no key yet or whose key has aged out.
+  // Returns true if anything was started, in which case the caller stands down
+  // and the resolver calls refresh() when the last one lands.
+  function resolveKeys(force) {
+    var started = false
+    for (var i = 0; i < servers.length; i++) {
+      if (!keyNeedsResolve(servers[i], force)) continue
+      var runner = keyRunners.objectAt(i)
+      if (runner && runner.resolve()) started = true
+    }
+    return started
+  }
+
+  function keyNeedsResolve(server, force) {
+    if (String(server.apiKeyCommand || "") === "") return false
+    var record = _apiKeys[server.index]
+    if (!record) return true
+    var age = Date.now() - record.at
+    // A forced refresh comes from a rejection, and rejections can arrive once
+    // per request; the cooldown is what stops that becoming a gpg prompt storm.
+    if (force) return age >= keyRetryCooldownMs
+    if (server.apiKeyTtlSec <= 0) return false
+    return age >= server.apiKeyTtlSec * 1000
+  }
+
+  function storeKey(index, value, ok) {
+    var keys = {}
+    for (var k in _apiKeys) keys[k] = _apiKeys[k]
+    // A failed command stores an empty value with a fresh timestamp on purpose:
+    // the request that follows fails with an honest "no credential" rather than
+    // silently reusing a token that may be why it is failing.
+    keys[index] = { value: ok ? value : "", at: Date.now(), failed: !ok || value === "" }
+    _apiKeys = keys
+  }
+
+  // Re-resolve one server's token after it was rejected, at most once per poll.
+  // The resolver restarts the whole poll when it lands, which is the retry.
+  function reauthAndRetry(index) {
+    var server = servers[index]
+    if (!server || String(server.apiKeyCommand || "") === "") return false
+    if (_authRetried[index] === _generation) return false
+    var runner = keyRunners.objectAt(index)
+    if (!runner || !keyNeedsResolve(server, true)) return false
+
+    var retried = {}
+    for (var k in _authRetried) retried[k] = _authRetried[k]
+    retried[index] = _generation
+    _authRetried = retried
+
+    if (!runner.resolve()) return false
+
+    var flags = {}
+    for (var f in _reauthed) flags[f] = _reauthed[f]
+    flags[index] = true
+    _reauthed = flags
+    return true
+  }
+
+  function clearReauthFlag(index) {
+    if (_reauthed[index] !== true) return
+    var flags = {}
+    for (var k in _reauthed) flags[k] = _reauthed[k]
+    delete flags[index]
+    _reauthed = flags
+  }
+
+  // The context that shapes an error message: which namespace was being read,
+  // which call it was, and whether we already tried a fresh token.
+  function errorContext(index, extra) {
+    var ctx = { refreshed: _reauthed[index] === true }
+    for (var key in extra) ctx[key] = extra[key]
+    return ctx
   }
 
   // --- http transport --------------------------------------------------------------
@@ -190,9 +300,30 @@ Item {
         startNamespaces(generation, index, Model.parseNamespaceList(json))
         release(generation, index)
       },
-      function (message) {
-        failServer(generation, index, message)
-      })
+      function (result) {
+        // ListNamespaces is a cluster-level call, so a credential scoped to two
+        // namespaces can read both and still be refused it. Failing the server
+        // for that hides data the token is entitled to; falling back to the
+        // configured list -- or to the one that worked last poll -- does not.
+        var fallback = Model.namespaceFallback(server, previousNamespaceNames(index), result)
+        if (fallback.fail) {
+          failServer(generation, index, fallback.message, result.kind)
+          return
+        }
+        _draft[index].notice = fallback.note
+        startNamespaces(generation, index, fallback.names)
+        release(generation, index)
+      },
+      "", { operation: "listNamespaces" })
+  }
+
+  // What this server showed last time, which is the second-best answer when the
+  // server stops being willing to say.
+  function previousNamespaceNames(index) {
+    var out = []
+    var entries = _draft[index].namespaces
+    for (var i = 0; i < entries.length; i++) out.push(entries[i].name)
+    return out
   }
 
   function startNamespaces(generation, index, names) {
@@ -249,11 +380,12 @@ Item {
         entry.loading = false
         release(generation, serverIndex)
       },
-      function (message) {
-        entry.error = message
+      function (result) {
+        entry.error = result.message
         entry.loading = false
         release(generation, serverIndex)
-      })
+      },
+      "", { namespace: entry.name })
   }
 
   function fetchWorkflows(generation, serverIndex, nsIndex) {
@@ -271,10 +403,11 @@ Item {
         entry.taskQueues = Model.taskQueuesFromExecutions(entry.workflows)
         release(generation, serverIndex)
       },
-      function (message) {
-        entry.error = message
+      function (result) {
+        entry.error = result.message
         release(generation, serverIndex)
-      })
+      },
+      "", { namespace: entry.name })
   }
 
   // --- cli transport ----------------------------------------------------------------
@@ -284,9 +417,13 @@ Item {
       cli: root.cliPath,
       address: server.address,
       profile: server.profile,
-      apiKey: apiKeyFor(server),
       timeoutSec: Math.max(root.requestTimeoutSec, 10)
     }
+    // Credentials come from Model.authSpec so the two transports cannot end up
+    // disagreeing about what a server's credentials are. This JSON goes to
+    // collect.py on stdin, never as an argument -- see collectorCommand.
+    var auth = Model.authSpec(server, apiKeyFor(server))
+    for (var field in auth) spec[field] = auth[field]
     for (var key in extra) spec[key] = extra[key]
     return JSON.stringify(spec)
   }
@@ -302,6 +439,9 @@ Item {
     runner.launch(generation, cliSpec(server, {
       mode: "poll",
       namespaces: server.namespaces,
+      // What to show if the server refuses to list namespaces. collect.py does
+      // not decide anything with this; it uses it and says that it did.
+      fallbackNamespaces: Model.namespaceFallback(server, previousNamespaceNames(index), null).names,
       recentLimit: root.recentLimit
     }))
   }
@@ -309,12 +449,22 @@ Item {
   function applyCliPoll(generation, index, payload, error) {
     if (generation !== _generation) return
     if (error !== "") {
-      failServer(generation, index, error)
+      var result = Model.classifyError(error, 0, errorContext(index, {}))
+      if (result.reauth) reauthAndRetry(index)
+      failServer(generation, index, result.message, result.kind)
       return
     }
 
     var state = _draft[index]
     state.cluster = Model.parseClusterInfo(payload.cluster)
+
+    if (payload.namespaceListError) {
+      var listFailure = Model.classifyError(payload.namespaceListError, 0,
+        errorContext(index, { operation: "listNamespaces" }))
+      if (listFailure.reauth) reauthAndRetry(index)
+      state.notice = Model.namespaceFallback(
+        servers[index], previousNamespaceNames(index), listFailure).note
+    }
 
     var names = Model.isList(payload.namespaceNames) ? payload.namespaceNames : []
     var entries = []
@@ -353,18 +503,22 @@ Item {
   function finishServer(generation, index) {
     if (generation !== _generation) return
     _draft[index].pending = false
+    // A server that answered is a token that works, so the next rejection is a
+    // new problem rather than "still rejected".
+    if (_draft[index].ok !== false) clearReauthFlag(index)
     publish()
     settleIfDone()
   }
 
   // A server only fails as a whole when namespace discovery fails; a single bad
   // namespace is recorded on that namespace and the rest still render.
-  function failServer(generation, index, message) {
+  function failServer(generation, index, message, kind) {
     if (generation !== _generation) return
     _outstanding[index] = 0
     _draft[index].ok = false
     _draft[index].pending = false
     _draft[index].error = message
+    _draft[index].errorKind = String(kind || "")
     publish()
     settleIfDone()
   }
@@ -392,6 +546,11 @@ Item {
         ok: state.ok,
         pending: state.pending,
         error: state.error,
+        // Why it failed, not just that it did: the panel colours an
+        // authentication failure differently from an unreachable host, and
+        // `omtemporal doctor` leads with it.
+        errorKind: state.errorKind || "",
+        notice: state.notice || "",
         cluster: state.cluster,
         namespaces: state.namespaces.slice()
       })
@@ -484,12 +643,12 @@ Item {
           onOk(json)
           finishDetailPart(generation, key, record)
         },
-        function (message) {
+        function (result) {
           if (generation !== _detailGeneration) return
-          record.error = record.error || message
+          record.error = record.error || result.message
           finishDetailPart(generation, key, record)
         },
-        "detail")
+        "detail", { namespace: route.namespace })
     }
 
     if (route.level === "workflow") {
@@ -562,37 +721,45 @@ Item {
 
   // --- http plumbing -------------------------------------------------------------------
 
-  function request(generation, server, url, onOk, onError, pool) {
+  // onError receives a classification from Model.classifyError, not a string:
+  // callers that only want to show something read .message, and the ones that
+  // have to decide -- fall back to configured namespaces, refresh the token --
+  // read .kind.
+  function request(generation, server, url, onOk, onError, pool, context) {
     var xhr = new XMLHttpRequest()
     if (pool === "detail") _detailInflight.push(xhr)
     else _inflight.push(xhr)
+
+    var ctx = errorContext(server.index, context)
 
     xhr.onreadystatechange = function () {
       if (xhr.readyState !== XMLHttpRequest.DONE) return
       if (xhr.cancelled === true) return
 
-      if (xhr.status === 0) {
-        onError("unreachable")
-        return
-      }
       if (xhr.status < 200 || xhr.status >= 300) {
-        onError(Model.errorMessage(xhr.responseText, xhr.status))
+        var result = Model.classifyError(xhr.responseText, xhr.status, ctx)
+        // An expired token is both the most likely cause and the one that
+        // fixes itself. The error is still reported, so a credential that is
+        // simply the wrong credential shows up rather than looping quietly.
+        if (result.reauth) root.reauthAndRetry(server.index)
+        onError(result)
         return
       }
       var parsed = null
       try {
         parsed = JSON.parse(xhr.responseText)
       } catch (error) {
-        onError("unreadable response")
+        onError(Model.classifyError("unreadable response", xhr.status, ctx))
         return
       }
       onOk(parsed)
     }
 
     xhr.open("GET", url)
-    xhr.setRequestHeader("Accept", "application/json")
-    var key = apiKeyFor(server)
-    if (key !== "") xhr.setRequestHeader("Authorization", "Bearer " + key)
+    // Accept, then whatever the deployment needs in front of Temporal (a
+    // Cloudflare Access pair, say), then the bearer token.
+    var headers = Model.httpHeaders(server, apiKeyFor(server))
+    for (var name in headers) xhr.setRequestHeader(name, headers[name])
     xhr.send()
   }
 
@@ -654,10 +821,14 @@ Item {
   // --- cli processes ----------------------------------------------------------------
 
   // `bash -lc` for the login PATH -- omarchy-shell does not inherit ~/.local/bin,
-  // which is where a hand-installed `temporal` usually lands. The spec goes in
-  // as a positional argument so no JSON ever has to survive shell quoting.
-  function collectorCommand(specJson) {
-    return ["bash", "-lc", "exec python3 \"$0\" \"$1\"", root.collectorPath, specJson]
+  // which is where a hand-installed `temporal` usually lands.
+  //
+  // The spec arrives on stdin, not as an argument. It carries the api key, and
+  // /proc/<pid>/cmdline is world readable: as an argument the token would be
+  // legible to every user on the machine for as long as the poll ran, several
+  // times a minute, forever. `-` is collect.py's "read the spec from stdin".
+  function collectorCommand() {
+    return ["bash", "-lc", "exec python3 \"$0\" -", root.collectorPath]
   }
 
   function readCollectorOutput(text, stderrText, exitCode) {
@@ -684,11 +855,25 @@ Item {
       id: pollProcess
       required property int index
       property int generation: 0
+      property string spec: ""
 
       function launch(gen, specJson) {
         pollProcess.generation = gen
-        pollProcess.command = root.collectorCommand(specJson)
+        pollProcess.spec = specJson
+        pollProcess.command = root.collectorCommand()
+        // Must be set before the process starts: Quickshell closes the write
+        // channel at spawn time when this is false, and it cannot be reopened.
+        pollProcess.stdinEnabled = true
         pollProcess.running = true
+      }
+
+      onStarted: {
+        pollProcess.write(pollProcess.spec)
+        // Closing stdin is the EOF collect.py's read() is waiting for. Clearing
+        // the copy afterwards keeps the token out of a property someone could
+        // print while debugging.
+        pollProcess.stdinEnabled = false
+        pollProcess.spec = ""
       }
 
       stdout: StdioCollector { id: pollOut; waitForEnd: true }
@@ -707,13 +892,22 @@ Item {
     property int generation: 0
     property string key: ""
     property var route: null
+    property string spec: ""
 
     function launch(gen, detailKey, detailRoute, specJson) {
       detailRunner.generation = gen
       detailRunner.key = detailKey
       detailRunner.route = detailRoute
-      detailRunner.command = root.collectorCommand(specJson)
+      detailRunner.spec = specJson
+      detailRunner.command = root.collectorCommand()
+      detailRunner.stdinEnabled = true
       detailRunner.running = true
+    }
+
+    onStarted: {
+      detailRunner.write(detailRunner.spec)
+      detailRunner.stdinEnabled = false
+      detailRunner.spec = ""
     }
 
     stdout: StdioCollector { id: detailOut; waitForEnd: true }
@@ -726,35 +920,45 @@ Item {
     }
   }
 
-  // --- api key resolution -------------------------------------------------------
+  // --- api key resolver processes ---------------------------------------------
 
-  // One short-lived process per server that configures `apiKeyCommand`, so
-  // tokens can live in a password manager instead of shell.json.
+  // One process slot per server that configures `apiKeyCommand`, so tokens can
+  // live in `pass`, `gopass`, `secret-tool` or `op` instead of in shell.json.
+  // Started on demand rather than at load: the poll asks for a key when it
+  // needs one and when the one it has has aged out.
   Instantiator {
+    id: keyRunners
     model: root.servers
 
     delegate: Process {
+      id: keyProcess
       required property var modelData
 
       readonly property string keyCommand: String(modelData.apiKeyCommand || "")
 
       command: ["bash", "-lc", keyCommand]
-      running: keyCommand !== ""
 
-      Component.onCompleted: if (keyCommand !== "") root._pendingKeys += 1
-
-      stdout: StdioCollector {
-        waitForEnd: true
-        onStreamFinished: {
-          var keys = root._apiKeys
-          keys[modelData.index] = String(text || "").trim()
-          root._apiKeys = keys
-        }
+      function resolve() {
+        if (keyCommand === "" || keyProcess.running) return false
+        root._pendingKeys += 1
+        keyProcess.running = true
+        return true
       }
+
+      stdout: StdioCollector { id: keyOut; waitForEnd: true }
+      // Collected and thrown away. A password manager writes prompts and
+      // warnings here, and forwarding them to the panel is how a passphrase
+      // prompt ends up rendered as a workflow error.
+      stderr: StdioCollector { id: keyErr; waitForEnd: true }
 
       onExited: function (exitCode) {
         root._pendingKeys = Math.max(0, root._pendingKeys - 1)
-        if (exitCode !== 0) console.warn("temporal: apiKeyCommand failed for", modelData.label)
+        root.storeKey(modelData.index, String(keyOut.text || "").trim(), exitCode === 0)
+        // The label and the exit code only. The command's output is the secret
+        // and its stderr may quote it back.
+        if (exitCode !== 0) {
+          console.warn("temporal: apiKeyCommand for", modelData.label, "exited", exitCode)
+        }
         if (root._pendingKeys === 0) root.refresh()
       }
     }
@@ -782,6 +986,8 @@ Item {
   // a server from the setup view takes effect on save rather than on restart.
   onServersChanged: {
     _apiKeys = ({})
+    _authRetried = ({})
+    _reauthed = ({})
     details = ({})
     Qt.callLater(root.refresh)
   }
