@@ -137,7 +137,10 @@ def connection_env(spec):
 
     for name, value in header_items(spec):
         if ENV_SAFE_HEADER.match(name):
-            env["TEMPORAL_GRPC_META_" + name.replace("-", "_")] = value
+            # Upper cased, because that is the spelling checked against the
+            # wire. HTTP/2 lower cases header names anyway, so normalizing the
+            # variable name costs nothing and keeps the mapping predictable.
+            env["TEMPORAL_GRPC_META_" + name.replace("-", "_").upper()] = value
 
     return env
 

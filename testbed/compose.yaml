@@ -100,6 +100,39 @@ services:
       temporal-b:
         condition: service_healthy
 
+  # An authenticating front door for temporal-a, on ports nothing else uses.
+  #
+  # `temporal server start-dev` cannot enforce authentication at all -- no
+  # --authorizer, no --config, and the TEMPORAL_AUTH_* variables the full
+  # distribution reads are ignored -- so this is the only way to exercise the
+  # plugin's 401/403 handling against something real. It is also the topology
+  # the feature is actually for: self-hosted Temporal behind a proxy.
+  #
+  # Behind a compose profile, so `docker compose up` is unchanged:
+  #
+  #   docker compose --profile auth up -d authproxy
+  #   OMT_AUTH_HTTP=http://localhost:7253 node testbed/parity-test.mjs
+  authproxy:
+    image: python:3.13-slim
+    container_name: omtemporal-authproxy
+    profiles: ["auth"]
+    restart: unless-stopped
+    command: ["python", "/app/authproxy.py"]
+    environment:
+      PYTHONUNBUFFERED: "1"
+      UPSTREAM: http://temporal-a:7243
+      TOKEN: s3cret-token-value
+      DENY_LIST: "1"
+      CF_ID: cf-client-id
+      CF_SECRET: cf-client-secret
+    volumes:
+      - ./authproxy.py:/app/authproxy.py:ro
+    ports:
+      - "7253:7253"
+    depends_on:
+      temporal-a:
+        condition: service_healthy
+
   # Keeps the boards alive: seeds a full spread of statuses on boot, then tops
   # up every SEED_INTERVAL so "recent workflows" never goes stale and the
   # running count moves while you watch it.

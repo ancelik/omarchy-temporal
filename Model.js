@@ -700,7 +700,12 @@ var TLS_PATTERNS = [
   /tls: /i,
   /certificate (signed by unknown authority|has expired|is not valid)/i,
   /bad certificate/i,
-  /remote error: tls/i
+  /remote error: tls/i,
+  // What the CLI says when tlsCertPath points at nothing. It is a config
+  // mistake rather than a handshake failure, but it belongs in the same
+  // paragraph of the same page, so it gets the same kind.
+  /invalid tls config/i,
+  /client cert\/key path/i
 ]
 
 function matchesAny(patterns, text) {
