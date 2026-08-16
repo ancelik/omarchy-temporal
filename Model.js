@@ -918,6 +918,33 @@ function deniedText(ctx, text) {
   return "no permission for this operation"
 }
 
+// Discovery succeeding while every namespace under it is refused is still a
+// broken server, and reporting it as "ok" is the most misleading thing this
+// widget can do: a credential scoped to nothing looks exactly like a healthy
+// fleet. Returns the failure to promote to the server, or null to leave it be.
+function namespaceFailure(namespaces) {
+  var entries = isList(namespaces) ? namespaces : []
+  if (entries.length === 0) return null
+
+  var kinds = {}
+  var firstError = ""
+  for (var i = 0; i < entries.length; i++) {
+    var entry = entries[i] || {}
+    if (entry.loading) return null    // still in flight; judge on the next tick
+    if (!entry.error) return null     // one that worked is enough to call it up
+    if (firstError === "") firstError = String(entry.error)
+    kinds[String(entry.errorKind || "unknown")] = true
+  }
+
+  var kindList = []
+  for (var kind in kinds) kindList.push(kind)
+  // When they all failed the same way, that reason is the server's reason.
+  // When they disagree, at least stop claiming success.
+  return kindList.length === 1
+    ? { error: firstError, kind: kindList[0] }
+    : { error: "every namespace failed to read", kind: "unknown" }
+}
+
 // --- namespace-level authorization -------------------------------------------------
 //
 // A credential scoped to two namespaces can read both of them and still be

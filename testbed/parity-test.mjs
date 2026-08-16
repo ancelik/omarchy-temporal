@@ -29,6 +29,7 @@ const EXPORTS = [
   "routeWorkflow", "detailKey", "taskQueuesFromExecutions", "mergeTaskQueue",
   "fleetEntries", "serverEntries", "namespaceEntries", "workflowDetailEntries",
   "taskQueueEntries", "firstSelectable", "nextSelectable", "primitiveGlyph",
+  "namespaceFailure",
   "authSummary", "authConfigIssues", "hasConfigError", "httpHeaders", "authSpec",
   "classifyError", "errorMessage", "namespaceFallback", "redact", "serverSecrets",
   "authReport", "failureWord", "normalizeServer", "clusterUrl", "namespacesUrl",
@@ -681,6 +682,39 @@ if (proxyUp) {
   check("into the same shape the unauthenticated server gives",
     Object.keys(Model.parseCounts(JSON.parse(counted.body))).sort(), ["counts", "total"])
 }
+
+// --- a server is only healthy if something under it read ---------------------------------
+//
+// Discovery can succeed while every namespace it found is refused. Reporting
+// that as "ok" makes a credential scoped to nothing look like a healthy fleet,
+// which is the exact failure this widget exists to catch.
+
+console.log("\nnamespace failure promotion")
+const ns = (over = {}) => ({ name: "n", error: "", errorKind: "", loading: false, ...over })
+
+check("all healthy stays healthy",
+  Model.namespaceFailure([ns(), ns()]), null)
+check("one healthy is enough",
+  Model.namespaceFailure([ns(), ns({ error: "nope", errorKind: "auth" })]), null)
+check("still loading defers judgement",
+  Model.namespaceFailure([ns({ loading: true }), ns({ error: "nope", errorKind: "auth" })]), null)
+check("no namespaces is not a failure",
+  Model.namespaceFailure([]), null)
+check("all failed the same way promotes that reason",
+  Model.namespaceFailure([
+    ns({ error: "token rejected for a", errorKind: "auth" }),
+    ns({ error: "token rejected for b", errorKind: "auth" })
+  ]),
+  { error: "token rejected for a", kind: "auth" })
+check("disagreeing failures still stop claiming success",
+  Model.namespaceFailure([
+    ns({ error: "token rejected", errorKind: "auth" }),
+    ns({ error: "timed out", errorKind: "timeout" })
+  ]),
+  { error: "every namespace failed to read", kind: "unknown" })
+check("a QVariant-style sequence is accepted",
+  Model.namespaceFailure({ length: 1, 0: ns({ error: "x", errorKind: "auth" }) }),
+  { error: "x", kind: "auth" })
 
 console.log(`\n${checks - failures}/${checks} passed`)
 process.exit(failures === 0 ? 0 : 1)

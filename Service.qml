@@ -143,8 +143,12 @@ Item {
       // Carry the previous poll's data into this one. Starting each tick blank
       // makes every server flash "0 namespaces" while it refreshes -- which on
       // the cli transport is a visible second, every time.
+      // Only data that read cleanly last time is worth carrying: keeping the
+      // counts from a namespace that has started refusing us paints a healthy
+      // fleet out of stale numbers that will never refresh again.
       var previous = i < serverStates.length && serverStates[i].label === servers[i].label
         ? serverStates[i] : null
+      if (previous && previous.ok === false) previous = null
       // Credentials that cannot work as configured -- a client certificate on
       // a transport that cannot present one, an HTTP url pointed at Temporal
       // Cloud -- are reported instead of polled. Earning the same handshake
@@ -337,7 +341,9 @@ Item {
       var carried = null
       var existing = _draft[index].namespaces
       for (var e = 0; e < existing.length; e++) {
-        if (existing[e].name === names[i]) carried = existing[e]
+        // A namespace carrying an error from last time starts blank, so its
+        // stale counts cannot outlive the access that produced them.
+        if (existing[e].name === names[i] && !existing[e].error) carried = existing[e]
       }
       entries.push(carried ? carried : blankNamespace(index, names[i]))
     }
@@ -365,6 +371,9 @@ Item {
       workflows: [],
       taskQueues: [],
       error: "",
+      // Kept alongside the message so a server can tell whether all its
+      // namespaces failed the same way -- see promoteNamespaceFailure.
+      errorKind: "",
       loading: true
     }
   }
@@ -383,6 +392,7 @@ Item {
       },
       function (result) {
         entry.error = result.message
+        entry.errorKind = result.kind
         entry.loading = false
         release(generation, serverIndex)
       },
@@ -406,6 +416,7 @@ Item {
       },
       function (result) {
         entry.error = result.message
+        entry.errorKind = result.kind
         release(generation, serverIndex)
       },
       "", { namespace: entry.name })
@@ -482,6 +493,7 @@ Item {
       }, names[i])
       entry.taskQueues = Model.taskQueuesFromExecutions(entry.workflows)
       entry.error = String(bundle.error || "")
+      entry.errorKind = entry.error === "" ? "" : Model.classifyError(entry.error, 0).kind
       entry.loading = false
       entries.push(entry)
     }
@@ -504,11 +516,24 @@ Item {
   function finishServer(generation, index) {
     if (generation !== _generation) return
     _draft[index].pending = false
+    promoteNamespaceFailure(index)
     // A server that answered is a token that works, so the next rejection is a
     // new problem rather than "still rejected".
     if (_draft[index].ok !== false) clearReauthFlag(index)
     publish()
     settleIfDone()
+  }
+
+  function promoteNamespaceFailure(index) {
+    var state = _draft[index]
+    if (state.ok === false) return
+
+    var failure = Model.namespaceFailure(state.namespaces)
+    if (!failure) return
+
+    state.ok = false
+    state.error = failure.error
+    state.errorKind = failure.kind
   }
 
   // A server only fails as a whole when namespace discovery fails; a single bad
