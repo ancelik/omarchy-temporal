@@ -23,7 +23,8 @@
       "openRefreshIntervalSec": 5,
       "recentLimit": 25,
       "requestTimeoutSec": 8,
-      "hideWhenIdle": false
+      "hideWhenIdle": false,
+      "brandColor": false
     },
     "schema": [
       {
@@ -66,6 +67,12 @@
         "key": "hideWhenIdle",
         "type": "boolean",
         "label": "Hide from the bar when nothing is running",
+        "defaultValue": false
+      },
+      {
+        "key": "brandColor",
+        "type": "boolean",
+        "label": "Use Temporal brand colour for the mark",
         "defaultValue": false
       }
     ]

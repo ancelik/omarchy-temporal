@@ -229,6 +229,28 @@ builders testable without a running shell.
 - **Batch operations are listed, not started.** Neither the Python SDK nor
   `temporal batch` can start one.
 
+## Branding
+
+The mark is Temporal's own symbol — the path from their published
+`Temporal_Symbol` SVG, converted to beziers and drawn on a Canvas so it stays
+sharp at bar sizes and can take the theme's colour. It is reproduced faithfully,
+including the merge at the lower-right crossing that makes the mark subtly
+asymmetric (that is in Temporal's own PNG export too, so it is the mark rather
+than an export artefact).
+
+By default the mark is drawn in your Omarchy theme's foreground colour, and in
+the theme's urgent colour when something needs attention. That is a deliberate
+departure from painting it Temporal's brand indigo: an Omarchy bar is themed end
+to end, a widget that ignores the active theme looks broken next to every other
+icon, and a mark that stays branded while the fleet is on fire is worse than one
+that turns red. Set `brandColor: true` to use Temporal's primary brand colour,
+**UV `#444CE7`**, when nothing is wrong.
+
+Temporal is a trademark of Temporal Technologies, Inc. This plugin is
+unofficial, is not affiliated with or endorsed by Temporal, and uses the mark
+only to identify the product it monitors. Brand assets and guidelines:
+<https://temporal.io/brand>.
+
 ## License
 
 MIT

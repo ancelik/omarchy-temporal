@@ -47,6 +47,20 @@ Panel {
   readonly property bool allDown: totals.servers > 0 && totals.down === totals.servers
   readonly property bool hideWhenIdle: setting("hideWhenIdle", false) === true
 
+  // Temporal's primary brand colour, "UV". Off by default: an Omarchy bar is
+  // themed end to end, and a widget that ignores the active theme to paint
+  // itself indigo looks broken next to every other icon. Opt in when brand
+  // fidelity matters more than fitting in.
+  readonly property color brandUv: "#444CE7"
+  readonly property bool useBrandColor: setting("brandColor", false) === true
+
+  // Trouble always wins over branding: a failing widget needs to read as
+  // failing, and a brand-coloured mark would hide that.
+  function markColor(fallback) {
+    if (troubled) return urgent
+    return useBrandColor ? brandUv : fallback
+  }
+
   // Onboarding takes over whenever there is nothing configured, so a fresh
   // install opens on something actionable rather than an empty list.
   readonly property bool onboarding: !service.configured || route.level === "setup"
@@ -395,7 +409,7 @@ Panel {
       TemporalIcon {
         anchors.verticalCenter: parent.verticalCenter
         iconSize: Style.bar.iconFont
-        color: root.allDown || !service.configured ? root.urgent : button.foreground
+        color: root.allDown || !service.configured ? root.urgent : root.markColor(button.foreground)
       }
 
       Text {
@@ -500,7 +514,7 @@ Panel {
               anchors.left: parent.left
               anchors.verticalCenter: parent.verticalCenter
               iconSize: Style.font.display
-              color: root.troubled ? root.urgent : root.foreground
+              color: root.markColor(root.foreground)
             }
 
             Column {
