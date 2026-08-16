@@ -1638,28 +1638,50 @@ function parentRoute(route) {
 // Breadcrumb segments, each carrying the glyph of the primitive it names, so
 // the trail itself teaches the hierarchy.
 function breadcrumb(route, serverStates) {
-  var crumbs = [{ kind: "fleet", glyph: primitiveGlyph("server"), label: "Servers" }]
+  // Each crumb carries the route it points at. Deriving the target by counting
+  // parentRoute() hops instead was wrong the moment a crumb existed that had no
+  // route of its own -- the setup screen's "which server" crumb -- and it
+  // silently sent you a level too far.
+  var crumbs = [{ kind: "fleet", glyph: primitiveGlyph("server"), label: "Servers", route: routeFleet() }]
   if (!route || route.level === "fleet") return crumbs
-  if (route.level === "setup") return crumbs.concat([{ kind: "setup", glyph: "󰒓", label: "Setup" }])
+  if (route.level === "setup") {
+    return crumbs.concat([{ kind: "setup", glyph: "󰒓", label: "Setup", route: routeSetup() }])
+  }
 
   var states = isList(serverStates) ? serverStates : []
   var server = states[route.serverIndex]
   crumbs.push({
     kind: "server",
     glyph: primitiveGlyph("server"),
-    label: server ? server.label : "server"
+    label: server ? server.label : "server",
+    route: routeServer(route.serverIndex)
   })
   if (route.level === "server") return crumbs
 
-  crumbs.push({ kind: "namespace", glyph: primitiveGlyph("namespace"), label: route.namespace })
+  crumbs.push({
+    kind: "namespace",
+    glyph: primitiveGlyph("namespace"),
+    label: route.namespace,
+    route: routeNamespace(route.serverIndex, route.namespace)
+  })
   if (route.level === "namespace") return crumbs
 
   if (route.level === "taskQueue") {
-    crumbs.push({ kind: "taskQueue", glyph: primitiveGlyph("taskQueue"), label: route.taskQueue })
+    crumbs.push({
+      kind: "taskQueue",
+      glyph: primitiveGlyph("taskQueue"),
+      label: route.taskQueue,
+      route: routeTaskQueue(route.serverIndex, route.namespace, route.taskQueue)
+    })
     return crumbs
   }
 
-  crumbs.push({ kind: "workflow", glyph: primitiveGlyph("workflow"), label: route.workflowId })
+  crumbs.push({
+    kind: "workflow",
+    glyph: primitiveGlyph("workflow"),
+    label: route.workflowId,
+    route: routeWorkflow(route.serverIndex, route.namespace, route.workflowId, route.runId)
+  })
   return crumbs
 }
 

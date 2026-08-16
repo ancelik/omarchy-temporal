@@ -25,7 +25,15 @@ Column {
 
   spacing: 0
 
+  // The row for an entry index. Indexing `children` instead was unsafe: the
+  // Repeater is itself a child of this Column, so the positions do not line up
+  // with entry indices and scrolling could target the wrong row -- or nothing.
+  function itemAt(index) {
+    return rows.itemAt(index)
+  }
+
   Repeater {
+    id: rows
     model: root.entries
 
     Column {

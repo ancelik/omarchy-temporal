@@ -96,8 +96,11 @@ Panel {
   // before anything was selectable ends up highlighting an info row that Enter
   // cannot act on. Re-clamp whenever the list changes.
   onEntriesChanged: {
+    // -1 included: a level where nothing can be selected -- a task queue is all
+    // pollers and counters -- must show no highlight at all, rather than park
+    // one on the first info row as though Enter would do something there.
     var clamped = Model.clampSelectable(entries, cursorIndex)
-    if (clamped >= 0 && clamped !== cursorIndex) cursorIndex = clamped
+    if (clamped !== cursorIndex) cursorIndex = clamped
   }
 
   readonly property var crumbs: {
@@ -106,7 +109,8 @@ Panel {
       return trail.concat([{
         kind: "server",
         glyph: Model.primitiveGlyph("server"),
-        label: setup.editServer.label
+        label: setup.editServer.label,
+        route: Model.routeSetup()
       }])
     }
     return trail
@@ -180,10 +184,33 @@ Panel {
     if (next.level === "setup" && route.level !== "setup") setup.scan()
     route = next
     cursorActive = true
-    cursorIndex = Math.max(0, Model.firstSelectable(entries))
+    cursorIndex = Model.firstSelectable(entries)
     if (panelFlick) panelFlick.contentY = 0
     service.activeRoute = next
     service.fetchDetail(next, true)
+  }
+
+  // Backing out unwinds the editing stack before the navigation one, so a
+  // half-typed credential is never thrown away by a keystroke meant to go back
+  // one step. Escape and h both come through here; they used to disagree, and
+  // h would abandon the editor and the setup screen in one go.
+  function goBack() {
+    if (onboarding && setup.editField !== "") {
+      setup.editField = ""
+      return
+    }
+    if (onboarding && setup.editIndex >= 0) {
+      setup.closeEditor()
+      return
+    }
+    ascend()
+  }
+
+  function goCrumb(crumb) {
+    if (!crumb || !crumb.route) return
+    // Clicking back to the setup crumb while editing means "out of this form".
+    if (crumb.route.level === "setup" && setup.editIndex >= 0) setup.closeEditor()
+    go(crumb.route)
   }
 
   function ascend() {
@@ -202,7 +229,7 @@ Panel {
       if (setup.activate(entry)) {
         // Adding or removing rewrites shell.json; the cursor should not sit on
         // a row that no longer exists.
-        Qt.callLater(function () { cursorIndex = Math.max(0, Model.firstSelectable(entries)) })
+        Qt.callLater(function () { cursorIndex = Model.firstSelectable(entries) })
       }
       return
     }
@@ -284,7 +311,7 @@ Panel {
 
   function cycleFilter() {
     filter = Model.nextFilter(filter)
-    cursorIndex = Math.max(0, Model.firstSelectable(entries))
+    cursorIndex = Model.firstSelectable(entries)
   }
 
   function scrollItemIntoView(item) {
@@ -304,9 +331,8 @@ Panel {
   }
 
   function scrollCursorIntoView() {
-    if (cursorIndex >= 0 && cursorIndex < entryList.children.length) {
-      scrollItemIntoView(entryList.children[cursorIndex])
-    }
+    if (cursorIndex < 0) return
+    scrollItemIntoView(entryList.itemAt(cursorIndex))
   }
 
   onOpenedChanged: if (opened) {
@@ -322,7 +348,7 @@ Panel {
     }
     service.activeRoute = route
     service.fetchDetail(route, true)
-    cursorIndex = Math.max(0, Model.firstSelectable(entries))
+    cursorIndex = Model.firstSelectable(entries)
     Qt.callLater(function () { keyCatcher.forceActiveFocus() })
   }
 
@@ -494,7 +520,7 @@ Panel {
 
       onMoveRequested: function (dx, dy) {
         if (dx < 0) {
-          root.ascend()
+          root.goBack()
           return
         }
         if (dx > 0) {
@@ -521,18 +547,8 @@ Panel {
         }
       }
       onCloseRequested: {
-        // Unwind the editing stack before the navigation one, so Esc never
-        // throws away a half-typed credential by closing the whole panel.
-        if (root.onboarding && setup.editField !== "") {
-          setup.editField = ""
-          keyCatcher.forceActiveFocus()
-          return
-        }
-        if (root.onboarding && setup.editIndex >= 0) {
-          setup.closeEditor()
-          return
-        }
-        root.ascend()
+        root.goBack()
+        keyCatcher.forceActiveFocus()
       }
       onTabRequested: function (direction) { root.switchPanel(direction) }
       onTextKey: function (text) {
@@ -542,9 +558,16 @@ Panel {
             service.refresh()
             service.fetchDetail(root.route, true)
           }
-        } else if (text === "f" || text === "F") root.cycleFilter()
+        } else if (text === "f" || text === "F") {
+          // Only the namespace level shows a filterable list; elsewhere this
+          // silently changed hidden state and jumped the cursor for no reason.
+          if (root.route.level === "namespace") root.cycleFilter()
+        }
         else if (text === "o" || text === "O") root.openCurrentInBrowser()
-        else if (text === "s" || text === "S") root.go(Model.routeSetup())
+        else if (text === "s" || text === "S") {
+          if (setup.editIndex >= 0) setup.closeEditor()
+          root.go(Model.routeSetup())
+        }
         else if (text === "a" || text === "A") {
           if (root.onboarding && setup.editIndex < 0) {
             setup.adding = true
@@ -637,14 +660,7 @@ Panel {
                         anchors.fill: parent
                         enabled: !parent.parent.last
                         cursorShape: Qt.PointingHandCursor
-                        onClicked: {
-                          // Clicking a crumb jumps straight to that level.
-                          var target = root.route
-                          for (var i = root.crumbs.length - 1; i > parent.parent.index; i--) {
-                            target = Model.parentRoute(target) || target
-                          }
-                          root.go(target)
-                        }
+                        onClicked: root.goCrumb(modelData)
                       }
                     }
                   }
