@@ -19,7 +19,7 @@ import "Model.js" as Model
 // drawn by EntryList.
 Panel {
   id: root
-  moduleName: "com.anilcelik.temporal"
+  moduleName: "io.github.ancelik.omarchy-temporal"
   ipcTarget: "temporal"
   manageIpc: false
 

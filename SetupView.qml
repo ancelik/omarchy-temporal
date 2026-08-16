@@ -17,7 +17,7 @@ import "Model.js" as Model
 Item {
   id: root
 
-  property string pluginId: "com.anilcelik.temporal"
+  property string pluginId: "io.github.ancelik.omarchy-temporal"
   property string collectorPath: ""
   property string cliPath: "temporal"
   property var servers: []

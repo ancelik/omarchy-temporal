@@ -19,3 +19,41 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+
+
+---
+
+Third-party dependencies
+========================
+
+This plugin bundles no third-party code. It runs inside Omarchy's Quickshell
+shell and, on the `cli` transport only, shells out to tools you install
+yourself:
+
+  Omarchy / omarchy-shell   MIT     the host shell; required
+    https://github.com/basecamp/omarchy
+
+  Quickshell (Qt/QML)       LGPL-3.0  provided by Omarchy, not bundled here
+    https://quickshell.org
+
+  temporal CLI              MIT     optional; only for servers configured with
+                                    transport "cli"
+    https://github.com/temporalio/cli
+
+  Python 3 standard library PSF-2.0 optional; runs collect.py for the same
+                                    transport. No packages are installed.
+
+Development only, never loaded by the plugin and not required to run it
+(see testbed/):
+
+  temporalio Python SDK     MIT     https://github.com/temporalio/sdk-python
+  temporalio/temporal image MIT     https://hub.docker.com/r/temporalio/temporal
+  python Docker image       PSF-2.0
+
+Trademark
+=========
+
+Temporal and the Temporal mark are trademarks of Temporal Technologies, Inc.
+The mark is reproduced in TemporalIcon.qml to identify the product this widget
+monitors. This plugin is unofficial and is not affiliated with, sponsored by,
+or endorsed by Temporal Technologies.

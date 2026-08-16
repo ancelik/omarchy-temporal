@@ -1,6 +1,6 @@
 {
   "schemaVersion": 1,
-  "id": "com.anilcelik.temporal",
+  "id": "io.github.ancelik.omarchy-temporal",
   "name": "Temporal",
   "version": "1.0.0",
   "author": "Anil Celik",

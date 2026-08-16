@@ -31,6 +31,20 @@ looks for servers on this machine and reads any profiles in your
 omtemporal setup
 ```
 
+## Remove
+
+```bash
+omarchy plugin remove io.github.ancelik.omarchy-temporal
+```
+
+That deletes `~/.config/omarchy/plugins/io.github.ancelik.omarchy-temporal/`
+and drops the widget from the bar. Your servers are stored on the widget's
+entry in `~/.config/omarchy/shell.json`, which `omarchy plugin remove` takes
+with it — if you want to keep them, copy that entry first.
+
+Nothing else is installed: no system packages, no services, no files outside
+Omarchy's own plugin and config directories.
+
 ## The primitives
 
 Each level of the panel shows exactly one kind of thing, with its own glyph and
@@ -80,7 +94,7 @@ widget's entry lives in `~/.config/omarchy/shell.json`:
 
 ```json
 {
-  "id": "com.anilcelik.temporal",
+  "id": "io.github.ancelik.omarchy-temporal",
   "refreshIntervalSec": 30,
   "servers": [
     { "label": "local", "url": "http://localhost:7243", "uiUrl": "http://localhost:8233" },
@@ -232,7 +246,7 @@ IPC handlers — after editing `Model.js` or adding an IPC method, run
 `omarchy-restart-shell`. Errors go to the shell's journal:
 
 ```bash
-journalctl --user -f | grep com.anilcelik.temporal
+journalctl --user -f | grep io.github.ancelik.omarchy-temporal
 ```
 
 ### Layout
@@ -287,6 +301,14 @@ unofficial, is not affiliated with or endorsed by Temporal, and uses the mark
 only to identify the product it monitors. Brand assets and guidelines:
 <https://temporal.io/brand>.
 
-## License
+## License and dependencies
 
-MIT
+MIT — see [LICENSE](LICENSE), which also lists third-party dependencies.
+
+The plugin itself is self-contained QML plus one stdlib-only Python script. It
+requires nothing beyond Omarchy unless you use the `cli` transport, which needs
+the [`temporal` CLI](https://docs.temporal.io/cli) (MIT) on your PATH and
+`python3` to run `collect.py`. The `http` transport needs neither.
+
+Everything under `testbed/` is for development only. It is not loaded by the
+plugin and is not needed to run it.
