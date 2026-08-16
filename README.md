@@ -20,7 +20,7 @@ Workflow — the only outbound action is opening a page in your browser.
 ## Install
 
 ```bash
-omarchy plugin add https://github.com/<you>/omtemporal.git --enable
+omarchy plugin add https://github.com/ancelik/omarchy-temporal.git --enable
 ```
 
 Then open the widget. With nothing configured it opens on a setup screen that
