@@ -415,6 +415,7 @@ Item {
         if (!alreadyConfigured({ url: httpFound[d].url })) duplicate = true
       }
       if (duplicate && found > 0) continue
+      found += 1
       out.push(Model.entry({
         section: "FOUND ON THIS MACHINE",
         sectionHint: "Servers answering on this machine.",
@@ -428,9 +429,10 @@ Item {
         payload: grpc
       }))
     }
+    // Only when nothing at all is on offer. Counting just the HTTP candidates
+    // meant a list with gRPC ones still in it claimed everything was already
+    // configured, contradicting the rows directly above the note.
     if (found === 0) {
-      // "Nothing here" and "everything here is already added" are different
-      // answers, and only one of them is a problem worth investigating.
       out.push(Model.noteEntry("FOUND ON THIS MACHINE",
         scanning
           ? "Scanning…"
